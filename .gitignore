@@ -1,0 +1,34 @@
+# Local tooling and environments
+.codex-log/
+.pixi/
+.venv/
+venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Training and evaluation outputs
+experiment/
+
+# Test, lint, and notebook caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
