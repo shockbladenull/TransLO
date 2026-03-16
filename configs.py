@@ -7,6 +7,71 @@ import argparse
   config
 """
 
+DEFAULT_KITTI_TRAIN_SEQS = [0, 1, 2, 3, 4, 5, 6]
+DEFAULT_KITTI_VAL_SEQS = [7, 8, 9, 10]
+DEFAULT_KITTI_TEST_SEQS = [7, 8, 9, 10]
+
+DEFAULT_OXFORD_TRAIN_SEQS = [
+    "2019-01-11-14-02-26-radar-oxford-10k",
+    "2019-01-14-12-05-52-radar-oxford-10k",
+    "2019-01-14-14-48-55-radar-oxford-10k",
+    "2019-01-18-15-20-12-radar-oxford-10k",
+]
+DEFAULT_OXFORD_VAL_SEQS = [
+    "2019-01-15-13-06-37-radar-oxford-10k",
+]
+
+SENSOR_PROFILES = {
+    "kitti_hdl64": {
+        "H_input": 64,
+        "W_input": 1792,
+        "vertical_view_up": 2.0,
+        "vertical_view_down": -24.8,
+    },
+    # Keep a 64-row projection grid for compatibility with the current backbone.
+    "oxford_hdl32": {
+        "H_input": 64,
+        "W_input": 1024,
+        "vertical_view_up": 10.67,
+        "vertical_view_down": -30.67,
+    },
+}
+
+
+def _normalize_list_arg(value, cast):
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        raw_items = []
+        for item in value:
+            if isinstance(item, str):
+                raw_items.extend([part for part in item.split(",") if part])
+            else:
+                raw_items.append(item)
+    elif isinstance(value, str):
+        raw_items = [part for part in value.split(",") if part]
+    else:
+        raw_items = [value]
+
+    return [cast(item) for item in raw_items]
+
+
+def _resolve_sensor_profile(args):
+    if args.sensor_profile == "auto":
+        sensor_profile = "oxford_hdl32" if args.train_dataset_type == "oxford_qe" else "kitti_hdl64"
+    else:
+        sensor_profile = args.sensor_profile
+
+    profile = SENSOR_PROFILES[sensor_profile]
+    for field, default_value in profile.items():
+        if getattr(args, field) is None:
+            setattr(args, field, default_value)
+
+    args.sensor_profile = sensor_profile
+    return args
+
+
 def translonet_args():
 
     parser = argparse.ArgumentParser()
@@ -17,17 +82,45 @@ def translonet_args():
     parser.add_argument('--eval_batch_size', type=int, default=8, help='Batch Size during evaling [default: 64]')
     parser.add_argument('--eval_before', type=int, default=0, help='if 1, eval before train')
 
-    parser.add_argument('--lidar_root', default='/dataset/data_odometry_velodyne/dataset', help='Dataset directory [default: /dataset]')
+    parser.add_argument('--train_dataset_type', choices=['kitti', 'oxford_qe'], default='kitti',
+                        help='Dataset used for training')
+    parser.add_argument('--val_dataset_type', choices=['kitti', 'oxford_qe'], default='kitti',
+                        help='Dataset used for validation')
+    parser.add_argument('--test_dataset_type', choices=['kitti', 'oxford_qe'], default='kitti',
+                        help='Dataset kept for explicit testing')
+
+    parser.add_argument('--lidar_root', default='/dataset/data_odometry_velodyne/dataset', help='KITTI dataset directory [default: /dataset]')
     parser.add_argument('--image_root', default='/dataset/data_odometry_color', help='Dataset directory [default: /dataset]')
+    parser.add_argument('--oxford_root', default=None, help='QEOxford dataset root')
+    parser.add_argument('--oxford_h5_name', default='velodyne_left_calibrateFalse.h5',
+                        help='QEOxford pose file name')
+    parser.add_argument('--oxford_train_seqs', nargs='+', default=list(DEFAULT_OXFORD_TRAIN_SEQS),
+                        help='QEOxford training sequences')
+    parser.add_argument('--oxford_val_seqs', nargs='+', default=list(DEFAULT_OXFORD_VAL_SEQS),
+                        help='QEOxford validation sequences')
+    parser.add_argument('--oxford_trim_edges', type=int, default=5,
+                        help='Drop N valid timestamps from both ends of each Oxford sequence')
+    parser.add_argument('--frame_gap', type=int, default=1,
+                        help='Temporal gap used to form relative pose pairs')
+    parser.add_argument('--kitti_train_seqs', nargs='+', type=int, default=list(DEFAULT_KITTI_TRAIN_SEQS),
+                        help='KITTI training sequences')
+    parser.add_argument('--kitti_val_seqs', nargs='+', type=int, default=list(DEFAULT_KITTI_VAL_SEQS),
+                        help='KITTI validation sequences')
+    parser.add_argument('--kitti_test_seqs', nargs='+', type=int, default=list(DEFAULT_KITTI_TEST_SEQS),
+                        help='KITTI test sequences')
     parser.add_argument('--log_dir', default='log_train', help='Log dir [default: log_train]')
 
     parser.add_argument('--num_points', type=int, default=150000, help='Point Number [default: 2048]')
 
-    parser.add_argument('--H_input', type=int, default=64, help='H Number [default: 64]')
-    parser.add_argument('--W_input', type=int, default=1792, help='W Number [default: 1800]')
+    parser.add_argument('--sensor_profile', choices=['auto', 'kitti_hdl64', 'oxford_hdl32'], default='auto',
+                        help='Projection profile for spherical range images')
+    parser.add_argument('--H_input', type=int, default=None, help='Projection height')
+    parser.add_argument('--W_input', type=int, default=None, help='Projection width')
+    parser.add_argument('--vertical_view_up', type=float, default=None, help='Upper vertical FoV in degrees')
+    parser.add_argument('--vertical_view_down', type=float, default=None, help='Lower vertical FoV in degrees')
 
     parser.add_argument('--max_epoch', type=int, default=301, help='Epoch to run [default: 151]')
-    parser.add_argument('--weight_decay', type=int, default=0.0001, help='The Weight decay [default : 0.0001]')
+    parser.add_argument('--weight_decay', type=float, default=0.0001, help='The Weight decay [default : 0.0001]')
     parser.add_argument('--workers', type=int, default=6,
                         help='Sets how many child processes can be used [default : 16]')
     parser.add_argument('--model_name', type=str, default='pwclonet', help='base_dir_name [default: pwclonet]')
@@ -65,6 +158,11 @@ def translonet_args():
     #Decoder
     parser.add_argument('--corr_decoder_has_pos_emb', type=bool, default=True, help='if decoder has pos emb')
 
-
     args = parser.parse_args()
+    args.kitti_train_seqs = _normalize_list_arg(args.kitti_train_seqs, int)
+    args.kitti_val_seqs = _normalize_list_arg(args.kitti_val_seqs, int)
+    args.kitti_test_seqs = _normalize_list_arg(args.kitti_test_seqs, int)
+    args.oxford_train_seqs = _normalize_list_arg(args.oxford_train_seqs, str)
+    args.oxford_val_seqs = _normalize_list_arg(args.oxford_val_seqs, str)
+    args = _resolve_sensor_profile(args)
     return args

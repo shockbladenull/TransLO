@@ -11,7 +11,14 @@ _EPS = 1e-6
 
 
 
-def ProjectPCimg2SphericalRing(PC, Feature = None, H_input = 64, W_input = 1800):
+def ProjectPCimg2SphericalRing(
+    PC,
+    Feature=None,
+    H_input=64,
+    W_input=1800,
+    vertical_view_down=-24.8,
+    vertical_view_up=2.0,
+):
 
     batch_size = len(PC)
 
@@ -19,12 +26,11 @@ def ProjectPCimg2SphericalRing(PC, Feature = None, H_input = 64, W_input = 1800)
         num_channel = Feature[0].shape[-1]
 
     degree2radian = math.pi / 180
-    nLines = H_input    
+    nLines = H_input
     AzimuthResolution = 360.0 / W_input # degree
-    VerticalViewDown = -24.8
-    VerticalViewUp = 2.0
+    VerticalViewDown = vertical_view_down
+    VerticalViewUp = vertical_view_up
 
-    # specifications of Velodyne-64
     AzimuthResolution = AzimuthResolution * degree2radian  # the original resolution is 0.18
     VerticalViewDown = VerticalViewDown * degree2radian
     VerticalViewUp = VerticalViewUp * degree2radian
@@ -40,6 +46,7 @@ def ProjectPCimg2SphericalRing(PC, Feature = None, H_input = 64, W_input = 1800)
         ###  initialize current processed frame 
             
         cur_PC = PC[batch_idx].to(torch.float32)  # N  3
+        device = cur_PC.device
         # print(cur_PC.shape)
         if Feature != None:
             cur_Feature = Feature[batch_idx]  # N  c
@@ -48,11 +55,11 @@ def ProjectPCimg2SphericalRing(PC, Feature = None, H_input = 64, W_input = 1800)
         y = cur_PC[:, 1] 
         z = cur_PC[:, 2]
 
-        r = torch.norm(cur_PC, p=2, dim =1)
+        r = torch.clamp(torch.norm(cur_PC, p=2, dim=1), min=_EPS)
 
-        PC_project_current = torch.zeros([H_input, W_input, 3]).cuda().detach()  # shape H W 3
+        PC_project_current = torch.zeros([H_input, W_input, 3], device=device).detach()  # shape H W 3
         if Feature != None:
-            Feature_project_current = torch.zeros([H_input, W_input, num_channel]).cuda().detach()
+            Feature_project_current = torch.zeros([H_input, W_input, num_channel], device=device).detach()
 
         ####  get iCol & iRow
                 
@@ -81,11 +88,11 @@ def ProjectPCimg2SphericalRing(PC, Feature = None, H_input = 64, W_input = 1800)
 
         # Generate mask
 
-        PC_mask_valid = torch.any(PC_project_current != 0, dim=-1).cuda().detach()  # H W
+        PC_mask_valid = torch.any(PC_project_current != 0, dim=-1).detach()  # H W
         PC_mask_valid = torch.unsqueeze(PC_mask_valid, dim=2).to(torch.float32) # H W 1
 
         if Feature != None:
-            Feature_mask_valid = ~torch.any(Feature_project_current!= 0, dim=-1).cuda().detach()  # H W
+            Feature_mask_valid = ~torch.any(Feature_project_current!= 0, dim=-1).detach()  # H W
             Feature_mask_valid = torch.unsqueeze(Feature_mask_valid, dim=2).to(torch.float32)
 
         ####1 h w

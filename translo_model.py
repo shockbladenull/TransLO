@@ -44,6 +44,8 @@ class translo_model(nn.Module):
 
         #####   initialize the parameters (distance  &  stride ) ######
         self.H_input = H_input; self.W_input = W_input
+        self.vertical_view_up = args.vertical_view_up
+        self.vertical_view_down = args.vertical_view_down
 
         self.Down_conv_dis = [0.75, 3.0, 6.0, 12.0]
         self.Up_conv_dis = [3.0, 6.0, 9.0]
@@ -253,13 +255,21 @@ class translo_model(nn.Module):
                                 drop_path=0.1, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False)
 
 
+    def _project(self, point_clouds, features=None, H_input=None, W_input=None):
+        return ProjectPCimg2SphericalRing(
+            point_clouds,
+            features,
+            H_input=self.H_input if H_input is None else H_input,
+            W_input=self.W_input if W_input is None else W_input,
+            vertical_view_down=self.vertical_view_down,
+            vertical_view_up=self.vertical_view_up,
+        )
+
 
     def forward(self, input_xyz_f1, input_xyz_f2, T_gt, T_trans, T_trans_inv):
-
         start_train = time.time()
 
         batch_size = len(input_xyz_f1)
-
         torch.cuda.synchronize()
         start_time = time.time()
 
@@ -270,8 +280,8 @@ class translo_model(nn.Module):
 
         ####proj func(2D3D)
 
-        input_xyz_aug_proj_f1, mask_xyz_f1 = ProjectPCimg2SphericalRing(input_xyz_aug_f1, None, self.H_input, self.W_input)  ## proj func
-        input_xyz_aug_proj_f2, mask_xyz_f2 = ProjectPCimg2SphericalRing(input_xyz_aug_f2, None, self.H_input, self.W_input)
+        input_xyz_aug_proj_f1, mask_xyz_f1 = self._project(input_xyz_aug_f1)  ## proj func
+        input_xyz_aug_proj_f2, mask_xyz_f2 = self._project(input_xyz_aug_f2)
 
         self.l0_b_idx, self.l0_h_idx, self.l0_w_idx = get_selected_idx(batch_size, self.out_H_list[0],
                                                                        self.out_W_list[0], self.stride_H_list[0],
@@ -398,7 +408,9 @@ class translo_model(nn.Module):
 
         ### re-project
 
-        l2_xyz_warp_proj_f1, l2_points_warp_proj_f1 = ProjectPCimg2SphericalRing(l2_flow_warped,  l2_points_f1, self.out_H_list[2], self.out_W_list[2])  #
+        l2_xyz_warp_proj_f1, l2_points_warp_proj_f1 = self._project(
+            l2_flow_warped, l2_points_f1, self.out_H_list[2], self.out_W_list[2]
+        )  #
         l2_xyz_warp_f1 = torch.reshape(l2_xyz_warp_proj_f1, [batch_size, -1, 3])
         l2_points_warp_f1 = torch.reshape(l2_points_warp_proj_f1, [batch_size, self.out_H_list[2] * self.out_W_list[2], -1])
 
@@ -458,7 +470,9 @@ class translo_model(nn.Module):
 
         ########## re-project
 
-        l1_xyz_warp_proj_f1, l1_points_warp_proj_f1 = ProjectPCimg2SphericalRing(l1_flow_warped, l1_points_f1, self.out_H_list[1], self.out_W_list[1])  #
+        l1_xyz_warp_proj_f1, l1_points_warp_proj_f1 = self._project(
+            l1_flow_warped, l1_points_f1, self.out_H_list[1], self.out_W_list[1]
+        )  #
         l1_xyz_warp_f1 = torch.reshape(l1_xyz_warp_proj_f1, [batch_size, -1, 3])
         l1_points_warp_f1 = torch.reshape(l1_points_warp_proj_f1, [batch_size, self.out_H_list[1] * self.out_W_list[1], -1])
         l1_mask_warped = torch.any(l1_xyz_warp_f1 != 0, dim=-1, keepdim=False)
@@ -523,7 +537,9 @@ class translo_model(nn.Module):
 
         ########## re-project
 
-        l0_xyz_warp_proj_f1, l0_points_warp_proj_f1 = ProjectPCimg2SphericalRing(l0_flow_warped, l0_points_f1, self.out_H_list[0], self.out_W_list[0])  #
+        l0_xyz_warp_proj_f1, l0_points_warp_proj_f1 = self._project(
+            l0_flow_warped, l0_points_f1, self.out_H_list[0], self.out_W_list[0]
+        )  #
         l0_xyz_warp_f1 = torch.reshape(l0_xyz_warp_proj_f1, [batch_size, -1, 3])
         l0_points_warp_f1 = torch.reshape(l0_points_warp_proj_f1, [batch_size, self.out_H_list[0] * self.out_W_list[0], -1])
         l0_mask_warped = torch.any(l0_xyz_warp_f1 != 0, dim=-1, keepdim=False)
@@ -602,5 +618,3 @@ def get_loss(l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, qq_gt, t_gt, w_x, w
 
 
 # if __name__ == "__main__":
-
-
