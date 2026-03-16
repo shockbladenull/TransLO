@@ -57,9 +57,9 @@ class Conv1d(nn.Module):
         )
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1).contiguous()
         x = self.composed_module(x)
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1).contiguous()
         return x
 
 
