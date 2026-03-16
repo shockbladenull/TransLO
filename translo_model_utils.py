@@ -153,8 +153,9 @@ def quatt2T(q, t):
     xX = x*X; xY = x*Y; xZ = x*Z
     yY = y*Y; yZ = y*Z; zZ = z*Z
 
-    c1 = torch.as_tensor(1.0).cuda()
-    add = torch.as_tensor([[1.0, 0, 0, 0]]).cuda()
+    device = q.device
+    c1 = torch.as_tensor(1.0, device=device, dtype=q.dtype)
+    add = torch.as_tensor([[1.0, 0, 0, 0]], device=device, dtype=q.dtype)
 
     T = ([[ c1-(yY+zZ), xY-wZ, xZ+wY, t0],
             [ xY+wZ, c1-(xX+zZ), yZ-wX, t1],
@@ -175,10 +176,14 @@ def euler2quat(z, y, x):
     sy = torch.sin(y)
     cx = torch.cos(x)
     sx = torch.sin(x)
-    return torch.tensor([cx*cy*cz - sx*sy*sz,
-                    cx*sy*sz + cy*cz*sx,
-                    cx*cz*sy - sx*cy*sz,
-                    cx*cy*sz + sx*cz*sy]).cuda()
+    return torch.stack(
+        [
+            cx * cy * cz - sx * sy * sz,
+            cx * sy * sz + cy * cz * sx,
+            cx * cz * sy - sx * cy * sz,
+            cx * cy * sz + sx * cz * sy,
+        ]
+    )
 
 def mat2euler(M, seq='zyx'):
 
@@ -264,14 +269,12 @@ def PreProcess(PC_f1, PC_f2, T_gt, T_trans, T_trans_inv, aug_frame):    ####    
 
 
     for p in PC_f1:
-        num_points = torch.tensor(p.shape[0], dtype=torch.int32)
-        add_T = torch.ones(num_points, 1).cuda().to(torch.float32)
+        add_T = torch.ones(p.shape[0], 1, device=p.device, dtype=torch.float32)
         PC_f1_add = torch.cat([p, add_T], -1)  ##  concat one to form   n 4
         PC_f1_concat.append(PC_f1_add)
 
     for p in PC_f2:
-        num_points = torch.tensor(p.shape[0], dtype=torch.int32)
-        add_T = torch.ones(num_points, 1).cuda().to(torch.float32)
+        add_T = torch.ones(p.shape[0], 1, device=p.device, dtype=torch.float32)
         PC_f2_add = torch.cat([p, add_T], -1)  ##  concat one to form   n 4
         PC_f2_concat.append(PC_f2_add)
     # print([m.shape for m in PC_f1_concat])
@@ -291,23 +294,23 @@ def PreProcess(PC_f1, PC_f2, T_gt, T_trans, T_trans_inv, aug_frame):    ####    
         ##  select the 30m * 30m region ########
 
         r_f1 = torch.norm(cur_PC_f1_concat[:, :2], p=2, dim =1, keepdim = True).repeat(1, 4)
-        cur_PC_f1_concat = torch.where( r_f1 > 30 , torch.zeros_like(cur_PC_f1_concat).cuda(), cur_PC_f1_concat ).to(torch.float32)
-        PC_mask_valid1 = torch.any(cur_PC_f1_concat != 0, dim=-1).cuda().detach()  # H W
+        cur_PC_f1_concat = torch.where(r_f1 > 30, torch.zeros_like(cur_PC_f1_concat), cur_PC_f1_concat).to(torch.float32)
+        PC_mask_valid1 = torch.any(cur_PC_f1_concat != 0, dim=-1).detach()  # H W
         cur_PC_f1_concat = cur_PC_f1_concat[PC_mask_valid1 > 0,:]
 
 
         r_f2 = torch.norm(cur_PC_f2_concat[:, :2], p=2, dim =1, keepdim = True).repeat(1, 4)
-        cur_PC_f2_concat = torch.where( r_f2 > 30 , torch.zeros_like(cur_PC_f2_concat).cuda(), cur_PC_f2_concat ).to(torch.float32)
+        cur_PC_f2_concat = torch.where(r_f2 > 30, torch.zeros_like(cur_PC_f2_concat), cur_PC_f2_concat).to(torch.float32)
 
-        PC_mask_valid2 = torch.any(cur_PC_f2_concat != 0, dim=-1).cuda().detach()  # H W
+        PC_mask_valid2 = torch.any(cur_PC_f2_concat != 0, dim=-1).detach()  # H W
         cur_PC_f2_concat = cur_PC_f2_concat[PC_mask_valid2 > 0, :]
 
 
         #####   generate  the  valid  mask (remove the not valid points)
-        mask_valid_f1 = torch.any(cur_PC_f1_concat != 0, dim=-1, keepdim=True).cuda().detach()  # N 1
+        mask_valid_f1 = torch.any(cur_PC_f1_concat != 0, dim=-1, keepdim=True).detach()  # N 1
         mask_valid_f1 = mask_valid_f1.to(torch.float32)
 
-        mask_valid_f2 = torch.any(cur_PC_f2_concat != 0, dim=-1, keepdim=True).cuda().detach()  # N 1
+        mask_valid_f2 = torch.any(cur_PC_f2_concat != 0, dim=-1, keepdim=True).detach()  # N 1
         mask_valid_f2 = mask_valid_f2.to(torch.float32)
 
         ####  ramdomly choose the aug frame (1 or 2)   ###############
@@ -394,8 +397,10 @@ def inv_q(q, batch_size):
 
     q = torch.squeeze(q, dim=1)
     q_2 = torch.sum(q * q, dim=-1, keepdim=True) + 1e-10
-    q0 = torch.index_select(q, 1, torch.LongTensor([0]).cuda())
-    q_ijk = -torch.index_select(q, 1, torch.LongTensor([1, 2, 3]).cuda())
+    index_0 = torch.tensor([0], device=q.device, dtype=torch.long)
+    index_ijk = torch.tensor([1, 2, 3], device=q.device, dtype=torch.long)
+    q0 = torch.index_select(q, 1, index_0)
+    q_ijk = -torch.index_select(q, 1, index_ijk)
     q_ = torch.cat([q0, q_ijk], dim=-1)
     q_inv = q_ / q_2
 

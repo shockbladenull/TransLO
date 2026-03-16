@@ -23,10 +23,14 @@ use_bn = False
 
 
 
-def get_hw_idx(B, out_H, out_W, stride_H = 1, stride_W = 1):
+def get_hw_idx(B, out_H, out_W, stride_H=1, stride_W=1, device=None):
 
-    H_idx = torch.reshape(torch.arange(0, out_H * stride_H, stride_H), [1, -1, 1, 1]).expand(B, out_H, out_W, 1)
-    W_idx = torch.reshape(torch.arange(0, out_W * stride_W, stride_W), [1, 1, -1, 1]).expand(B, out_H, out_W, 1)
+    H_idx = torch.reshape(torch.arange(0, out_H * stride_H, stride_H, device=device), [1, -1, 1, 1]).expand(
+        B, out_H, out_W, 1
+    )
+    W_idx = torch.reshape(torch.arange(0, out_W * stride_W, stride_W, device=device), [1, 1, -1, 1]).expand(
+        B, out_H, out_W, 1
+    )
 
     idx_n2 = torch.cat([H_idx, W_idx], dim = -1).reshape(B, -1, 2)
 
@@ -101,7 +105,6 @@ class PointNetSaModule(nn.Module):
 
         super(PointNetSaModule,self).__init__()
 
-        self.batch_size = batch_size
         self.K_sample = K_sample
         self.kernel_size = kernel_size
         self.H = H; self.W = W
@@ -123,36 +126,43 @@ class PointNetSaModule(nn.Module):
             self.in_channels = num_out_channel
 
     def forward(self, xyz_proj, points_proj, xyz_sampled_proj):
-        
-        self.idx_n2 = get_hw_idx(self.batch_size, out_H = self.H, out_W = self.W, stride_H = self.stride_H, stride_W = self.stride_W) ## b -1 2
-
         B = xyz_proj.shape[0]
         H = xyz_proj.shape[1]
         W = xyz_proj.shape[2]
         C = points_proj.shape[3]
+        device = xyz_proj.device
+
+        idx_n2 = get_hw_idx(
+            B,
+            out_H=self.H,
+            out_W=self.W,
+            stride_H=self.stride_H,
+            stride_W=self.stride_W,
+            device=device,
+        ).to(dtype=torch.int32)
 
         h = xyz_sampled_proj.shape[1]
         w = xyz_sampled_proj.shape[2]
 
         kernel_total = self.kernel_size[0] * self.kernel_size[1]
     
-        n_sampled = self.idx_n2.shape[1]    #  n_sampled = h*w
+        n_sampled = idx_n2.shape[1]    #  n_sampled = h*w
 
-        random_HW = (torch.arange(self.kernel_size[0] * self.kernel_size[1])).int().cuda()
+        random_HW = torch.arange(self.kernel_size[0] * self.kernel_size[1], device=device, dtype=torch.int32)
         
         ##randperm 
         
         #################   fused_conv   default  padding = 'same'
 
-        select_b_idx = torch.zeros(B, n_sampled, self.K_sample, 1).cuda().long().detach()       # (B, n_sampled, K_sampled, 1)
-        select_h_idx = torch.zeros(B, n_sampled, self.K_sample, 1).cuda().long().detach()
-        select_w_idx = torch.zeros(B, n_sampled, self.K_sample, 1).cuda().long().detach()
+        select_b_idx = torch.zeros(B, n_sampled, self.K_sample, 1, device=device, dtype=torch.long).detach()
+        select_h_idx = torch.zeros(B, n_sampled, self.K_sample, 1, device=device, dtype=torch.long).detach()
+        select_w_idx = torch.zeros(B, n_sampled, self.K_sample, 1, device=device, dtype=torch.long).detach()
 
-        valid_idx = torch.zeros(B, n_sampled, kernel_total, 1).cuda().float().detach()                  # (B, n_sampled, H*W, 1)    
-        valid_in_dis_idx = torch.zeros(B, n_sampled, kernel_total, 1).cuda().float().detach()
-        valid_mask = torch.zeros(B, n_sampled, self.K_sample, 1).cuda().float().detach()     # (B, n_sampled, K_sampled, 1)
+        valid_idx = torch.zeros(B, n_sampled, kernel_total, 1, device=device, dtype=torch.float32).detach()
+        valid_in_dis_idx = torch.zeros(B, n_sampled, kernel_total, 1, device=device, dtype=torch.float32).detach()
+        valid_mask = torch.zeros(B, n_sampled, self.K_sample, 1, device=device, dtype=torch.float32).detach()
 
-        idx_n2_part = self.idx_n2.cuda().int().contiguous()   # (B N 2)
+        idx_n2_part = idx_n2.contiguous()   # (B N 2)
         
         with torch.no_grad():
         # Sample n' points from input n points 
@@ -224,11 +234,11 @@ class cost_volume(nn.Module):
         self.corr_func = corr_func
         self.distance1 = distance
         self.distance2 = distance2
+        self.stride_H = stride_H
+        self.stride_W = stride_W
         self.mlp1_convs = nn.ModuleList()
         self.mlp2_convs = nn.ModuleList()
         self.mlp2_convs_new = nn.ModuleList()
-
-        self.idx_n2 = get_hw_idx(batch_size, H, W, stride_H, stride_W)
 
         for i, num_out_channel in enumerate(mlp1):
             self.mlp1_convs.append(Conv2d(self.in_channels,num_out_channel,[1,1],stride=[1,1], bn=self.bn))
@@ -255,24 +265,25 @@ class cost_volume(nn.Module):
         H = warped_xyz1_proj.shape[1]
         W = warped_xyz1_proj.shape[2]
         C = points2_proj.shape[3]
+        device = warped_xyz1_proj.device
 
         warped_xyz1 = warped_xyz1_proj.reshape(B, -1, 3)
         points1 = points1_proj.reshape(B, -1, points1_proj.shape[-1])
 
         kernel_total_q = self.kernel_size2[0] * self.kernel_size2[1]
 
-        random_HW_q = (torch.arange(0,kernel_total_q)).cuda().int()
+        random_HW_q = torch.arange(0, kernel_total_q, device=device, dtype=torch.int32)
 
-        idx_hw = self.idx_n2.cuda().int().contiguous()
+        idx_hw = get_hw_idx(B, H, W, self.stride_H, self.stride_W, device=device).to(dtype=torch.int32).contiguous()
 
         # Initialize
-        select_b_idx = torch.zeros(B, H*W, self.nsample_q, 1).cuda().long().detach()             # (B N nsample_q 1)
-        select_h_idx = torch.zeros(B, H*W, self.nsample_q, 1).cuda().long().detach()
-        select_w_idx = torch.zeros(B, H*W, self.nsample_q, 1).cuda().long().detach()
+        select_b_idx = torch.zeros(B, H * W, self.nsample_q, 1, device=device, dtype=torch.long).detach()
+        select_h_idx = torch.zeros(B, H * W, self.nsample_q, 1, device=device, dtype=torch.long).detach()
+        select_w_idx = torch.zeros(B, H * W, self.nsample_q, 1, device=device, dtype=torch.long).detach()
 
-        valid_idx = torch.zeros(B, H*W, kernel_total_q, 1).cuda().float().detach()
-        valid_in_dis_idx = torch.zeros(B, H*W, kernel_total_q, 1).cuda().float().detach()
-        select_mask = torch.zeros(B, H*W, self.nsample_q, 1).cuda().float().detach()
+        valid_idx = torch.zeros(B, H * W, kernel_total_q, 1, device=device, dtype=torch.float32).detach()
+        valid_in_dis_idx = torch.zeros(B, H * W, kernel_total_q, 1, device=device, dtype=torch.float32).detach()
+        select_mask = torch.zeros(B, H * W, self.nsample_q, 1, device=device, dtype=torch.float32).detach()
         
         with torch.no_grad():
         # Sample QNN of (M neighbour points from sampled n points in PC1) in PC2
@@ -346,9 +357,9 @@ class cost_volume(nn.Module):
         for j,conv in enumerate(self.mlp2_convs):
             pi_concat = conv(pi_concat)
 
-        valid_mask_bool = torch.eq(valid_mask, torch.ones_like(valid_mask).cuda())
+        valid_mask_bool = torch.eq(valid_mask, torch.ones_like(valid_mask))
         WQ_mask = valid_mask_bool.expand(B, H*W, self.nsample_q, pi_concat.shape[-1])                  #  B N K MLP[-1]     
-        pi_concat_mask = torch.where(WQ_mask, pi_concat, torch.ones_like(pi_concat).cuda() * (-1e10)) 
+        pi_concat_mask = torch.where(WQ_mask, pi_concat, torch.ones_like(pi_concat) * (-1e10)) 
         WQ = F.softmax(pi_concat_mask, dim=2)
 
         # First Attentive Flow Embedding e(M) ---  w(Q) * h(Q)
@@ -362,16 +373,16 @@ class cost_volume(nn.Module):
         
         kernel_total_p = self.kernel_size1[0] * self.kernel_size1[1]
 
-        random_HW_p = (torch.arange(0,kernel_total_p)).cuda().int()
+        random_HW_p = torch.arange(0, kernel_total_p, device=device, dtype=torch.int32)
         # nsample = kernel_size1[0] * kernel_size1[1]
 
-        select_b_idx = torch.zeros(B, H*W, self.nsample, 1).cuda().long().detach()           # (B N nsample 1)
-        select_h_idx = torch.zeros(B, H*W, self.nsample, 1).cuda().long().detach()
-        select_w_idx = torch.zeros(B, H*W, self.nsample, 1).cuda().long().detach()
+        select_b_idx = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.long).detach()
+        select_h_idx = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.long).detach()
+        select_w_idx = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.long).detach()
 
-        valid_idx = torch.zeros(B, H*W, kernel_total_p, 1).cuda().float().detach()
-        valid_in_dis_idx = torch.zeros(B, H*W, kernel_total_p, 1).cuda().float().detach()
-        select_mask = torch.zeros(B, H*W, self.nsample, 1).cuda().float().detach()
+        valid_idx = torch.zeros(B, H * W, kernel_total_p, 1, device=device, dtype=torch.float32).detach()
+        valid_in_dis_idx = torch.zeros(B, H * W, kernel_total_p, 1, device=device, dtype=torch.float32).detach()
+        select_mask = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.float32).detach()
         
         with torch.no_grad():
         # # Sample QNN of (M neighbour points from sampled n points in PC1) in PC1
@@ -418,9 +429,9 @@ class cost_volume(nn.Module):
         for j,conv in enumerate(self.mlp2_convs_new):
             pc_concat = conv(pc_concat)
 
-        valid_mask2_bool = torch.eq(valid_mask2, torch.ones_like(valid_mask2).cuda()) 
+        valid_mask2_bool = torch.eq(valid_mask2, torch.ones_like(valid_mask2)) 
         WP_mask = valid_mask2_bool.expand(B, H*W, self.nsample, pc_concat.shape[-1])   ####   B N K MLP[-1]    #####################  
-        pc_concat_mask = torch.where(WP_mask, pc_concat, torch.ones_like(pc_concat).cuda() * (-1e10)) 
+        pc_concat_mask = torch.where(WP_mask, pc_concat, torch.ones_like(pc_concat) * (-1e10)) 
         WP = F.softmax(pc_concat_mask,dim=2)   #####  b, npoints, nsample, mlp[-1]
 
         # Final Attentive Flow Embedding --- w(M) * xyz1(M) 
@@ -458,7 +469,6 @@ class set_upconv_module(nn.Module):
             BNC feature
         """
 
-        self.batch_size = batch_size
         self.kernel_size = kernel_size
         self.nsample = nsample
         self.mlp = mlp
@@ -476,9 +486,6 @@ class set_upconv_module(nn.Module):
         self.last_channel = in_channels[-1] + 3  # LAST CHANNEL = C+3
         self.mlp_conv = nn.ModuleList()
         self.mlp2_conv = nn.ModuleList()
-
-        self.idx_n2 = get_hw_idx(batch_size, H, W, 1, 1)
-
 
         if mlp is not None:
             for i,num_out_channel in enumerate(mlp):
@@ -503,6 +510,7 @@ class set_upconv_module(nn.Module):
         H = xyz1_proj.shape[1]
         W = xyz1_proj.shape[2]
         C = feat2_proj.shape[3]
+        device = xyz1_proj.device
 
         SMALL_H = xyz2_proj.shape[1]
         SMALL_W = xyz2_proj.shape[2]
@@ -510,18 +518,18 @@ class set_upconv_module(nn.Module):
         xyz1 = xyz1_proj.reshape(B, -1, 3)
         points1 = points1_proj.reshape(B, -1, points1_proj.shape[-1])
 
-        idx_hw = self.idx_n2.cuda().int().contiguous()                               ###  B N 2
+        idx_hw = get_hw_idx(B, H, W, 1, 1, device=device).to(dtype=torch.int32).contiguous()  ###  B N 2
         
         kernel_total = self.kernel_size[0] * self.kernel_size[1]
-        random_HW = (torch.arange(kernel_total)).cuda().int()
+        random_HW = torch.arange(kernel_total, device=device, dtype=torch.int32)
    
-        select_b_idx = torch.zeros(B, H*W, self.nsample, 1).cuda().long().detach()       # B N n_sample 1
-        select_h_idx = torch.zeros(B, H*W, self.nsample, 1).cuda().long().detach()
-        select_w_idx = torch.zeros(B, H*W, self.nsample, 1).cuda().long().detach()
+        select_b_idx = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.long).detach()
+        select_h_idx = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.long).detach()
+        select_w_idx = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.long).detach()
 
-        valid_idx = torch.zeros(B, H*W, kernel_total, 1).cuda().float().detach()         # B N kernel_total 1
-        valid_in_dis_idx = torch.zeros(B, H*W, kernel_total, 1).cuda().float().detach()
-        select_mask = torch.zeros(B, H*W, self.nsample, 1).cuda().float().detach()       # B N n_sample 1
+        valid_idx = torch.zeros(B, H * W, kernel_total, 1, device=device, dtype=torch.float32).detach()
+        valid_in_dis_idx = torch.zeros(B, H * W, kernel_total, 1, device=device, dtype=torch.float32).detach()
+        select_mask = torch.zeros(B, H * W, self.nsample, 1, device=device, dtype=torch.float32).detach()
 
 
         with torch.no_grad():

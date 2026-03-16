@@ -16,7 +16,7 @@ from transformer.cross_swin_transformer import Cross_BasicLayer
 scale = 1.0
 
 
-def get_selected_idx(batch_size, out_H: int, out_W: int, stride_H: int, stride_W: int):
+def get_selected_idx(batch_size, out_H: int, out_W: int, stride_H: int, stride_W: int, device=None):
     """According to given stride and output size, return the corresponding selected points
 
     Args:
@@ -28,11 +28,13 @@ def get_selected_idx(batch_size, out_H: int, out_W: int, stride_H: int, stride_W
     Returns:
         [tf.Tensor]: [shape (B, outh, outw, 3) indices]
     """
-    select_h_idx = torch.arange(0, out_H * stride_H, stride_H)
-    select_w_idx = torch.arange(0, out_W * stride_W, stride_W)
+    select_h_idx = torch.arange(0, out_H * stride_H, stride_H, device=device)
+    select_w_idx = torch.arange(0, out_W * stride_W, stride_W, device=device)
     height_indices = (torch.reshape(select_h_idx, (1, -1, 1))).expand(batch_size, out_H, out_W)         # b out_H out_W
     width_indices = (torch.reshape(select_w_idx, (1, 1, -1))).expand(batch_size, out_H, out_W)            # b out_H out_W
-    padding_indices = torch.reshape(torch.arange(batch_size), (-1, 1, 1)).expand(batch_size, out_H, out_W)   # b out_H out_W
+    padding_indices = torch.reshape(torch.arange(batch_size, device=device), (-1, 1, 1)).expand(
+        batch_size, out_H, out_W
+    )   # b out_H out_W
 
     return padding_indices, height_indices, width_indices
 
@@ -268,6 +270,8 @@ class translo_model(nn.Module):
     def forward(self, input_xyz_f1, input_xyz_f2, T_gt, T_trans, T_trans_inv):
 
         batch_size = len(input_xyz_f1)
+        device = T_gt.device
+        coord_idx = torch.arange(1, 4, device=device, dtype=torch.long)
 
         aug_frame = np.random.choice([1, 2], size = batch_size, replace = True) # random choose aug frame 1 or 2
         input_xyz_aug_f1, input_xyz_aug_f2, q_gt, t_gt = PreProcess(input_xyz_f1, input_xyz_f2, T_gt, T_trans, T_trans_inv, aug_frame)
@@ -279,49 +283,69 @@ class translo_model(nn.Module):
         input_xyz_aug_proj_f1, mask_xyz_f1 = self._project(input_xyz_aug_f1)  ## proj func
         input_xyz_aug_proj_f2, mask_xyz_f2 = self._project(input_xyz_aug_f2)
 
-        self.l0_b_idx, self.l0_h_idx, self.l0_w_idx = get_selected_idx(batch_size, self.out_H_list[0],
-                                                                       self.out_W_list[0], self.stride_H_list[0],
-                                                                       self.stride_W_list[0])
-        self.l1_b_idx, self.l1_h_idx, self.l1_w_idx = get_selected_idx(batch_size, self.out_H_list[1],
-                                                                       self.out_W_list[1], self.stride_H_list[1],
-                                                                       self.stride_W_list[1])
-        self.l2_b_idx, self.l2_h_idx, self.l2_w_idx = get_selected_idx(batch_size, self.out_H_list[2],
-                                                                       self.out_W_list[2], self.stride_H_list[2],
-                                                                       self.stride_W_list[2])
-        self.l3_b_idx, self.l3_h_idx, self.l3_w_idx = get_selected_idx(batch_size, self.out_H_list[3],
-                                                                       self.out_W_list[3], self.stride_H_list[3],
-                                                                       self.stride_W_list[3])
+        self.l0_b_idx, self.l0_h_idx, self.l0_w_idx = get_selected_idx(
+            batch_size,
+            self.out_H_list[0],
+            self.out_W_list[0],
+            self.stride_H_list[0],
+            self.stride_W_list[0],
+            device=device,
+        )
+        self.l1_b_idx, self.l1_h_idx, self.l1_w_idx = get_selected_idx(
+            batch_size,
+            self.out_H_list[1],
+            self.out_W_list[1],
+            self.stride_H_list[1],
+            self.stride_W_list[1],
+            device=device,
+        )
+        self.l2_b_idx, self.l2_h_idx, self.l2_w_idx = get_selected_idx(
+            batch_size,
+            self.out_H_list[2],
+            self.out_W_list[2],
+            self.stride_H_list[2],
+            self.stride_W_list[2],
+            device=device,
+        )
+        self.l3_b_idx, self.l3_h_idx, self.l3_w_idx = get_selected_idx(
+            batch_size,
+            self.out_H_list[3],
+            self.out_W_list[3],
+            self.stride_H_list[3],
+            self.stride_W_list[3],
+            device=device,
+        )
         ###########################
         # Kernel center #
         ###########################
         ####  the l0 select bn3 xyz
-        l0_xyz_proj_f1 = input_xyz_aug_proj_f1[self.l0_b_idx.cuda().long(), self.l0_h_idx.cuda().long(), self.l0_w_idx.cuda().long(), :]  ####  PC1，PC2
-        l0_xyz_proj_f2 = input_xyz_aug_proj_f2[self.l0_b_idx.cuda().long(), self.l0_h_idx.cuda().long(), self.l0_w_idx.cuda().long(), :]
+        l0_xyz_proj_f1 = input_xyz_aug_proj_f1[self.l0_b_idx.long(), self.l0_h_idx.long(), self.l0_w_idx.long(), :]  ####  PC1，PC2
+        l0_xyz_proj_f2 = input_xyz_aug_proj_f2[self.l0_b_idx.long(), self.l0_h_idx.long(), self.l0_w_idx.long(), :]
         ####  the l1 select bn3 xyz
-        l1_xyz_proj_f1 = l0_xyz_proj_f1[self.l1_b_idx.cuda().long(), self.l1_h_idx.cuda().long(), self.l1_w_idx.cuda().long(), :]
-        l1_xyz_proj_f2 = l0_xyz_proj_f2[self.l1_b_idx.cuda().long(), self.l1_h_idx.cuda().long(), self.l1_w_idx.cuda().long(), :]
+        l1_xyz_proj_f1 = l0_xyz_proj_f1[self.l1_b_idx.long(), self.l1_h_idx.long(), self.l1_w_idx.long(), :]
+        l1_xyz_proj_f2 = l0_xyz_proj_f2[self.l1_b_idx.long(), self.l1_h_idx.long(), self.l1_w_idx.long(), :]
         ####  the l2 select bn3 xyz
-        l2_xyz_proj_f1 = l1_xyz_proj_f1[self.l2_b_idx.cuda().long(), self.l2_h_idx.cuda().long(), self.l2_w_idx.cuda().long(), :]
-        l2_xyz_proj_f2 = l1_xyz_proj_f2[self.l2_b_idx.cuda().long(), self.l2_h_idx.cuda().long(), self.l2_w_idx.cuda().long(), :]
+        l2_xyz_proj_f1 = l1_xyz_proj_f1[self.l2_b_idx.long(), self.l2_h_idx.long(), self.l2_w_idx.long(), :]
+        l2_xyz_proj_f2 = l1_xyz_proj_f2[self.l2_b_idx.long(), self.l2_h_idx.long(), self.l2_w_idx.long(), :]
         ####  the l3 select bn3 xyz
-        l3_xyz_proj_f1 = l2_xyz_proj_f1[self.l3_b_idx.cuda().long(), self.l3_h_idx.cuda().long(), self.l3_w_idx.cuda().long(), :]
-        l3_xyz_proj_f2 = l2_xyz_proj_f2[self.l3_b_idx.cuda().long(), self.l3_h_idx.cuda().long(), self.l3_w_idx.cuda().long(), :]
+        l3_xyz_proj_f1 = l2_xyz_proj_f1[self.l3_b_idx.long(), self.l3_h_idx.long(), self.l3_w_idx.long(), :]
+        l3_xyz_proj_f2 = l2_xyz_proj_f2[self.l3_b_idx.long(), self.l3_h_idx.long(), self.l3_w_idx.long(), :]
 
         ###########################
         # Binary masks #
         ###########################
         ####  the l0 select bn1 mask
-        l0_mask_f1 = mask_xyz_f1[self.l0_b_idx.cuda().long(), self.l0_h_idx.cuda().long(), self.l0_w_idx.cuda().long(), :]  ####  PC1，PC2
-        l0_mask_f2 = mask_xyz_f2[self.l0_b_idx.cuda().long(), self.l0_h_idx.cuda().long(), self.l0_w_idx.cuda().long(), :]
+        l0_mask_f1 = mask_xyz_f1[self.l0_b_idx.long(), self.l0_h_idx.long(), self.l0_w_idx.long(), :]  ####  PC1，PC2
+        l0_mask_f2 = mask_xyz_f2[self.l0_b_idx.long(), self.l0_h_idx.long(), self.l0_w_idx.long(), :]
         ####  the l1 select bn1 mask
-        l1_mask_f1 = l0_mask_f1[self.l1_b_idx.cuda().long(), self.l1_h_idx.cuda().long(), self.l1_w_idx.cuda().long(), :]
-        l1_mask_f2 = l0_mask_f2[self.l1_b_idx.cuda().long(), self.l1_h_idx.cuda().long(), self.l1_w_idx.cuda().long(), :]
+        l1_mask_f1 = l0_mask_f1[self.l1_b_idx.long(), self.l1_h_idx.long(), self.l1_w_idx.long(), :]
+        l1_mask_f2 = l0_mask_f2[self.l1_b_idx.long(), self.l1_h_idx.long(), self.l1_w_idx.long(), :]
         ####  the l2 select bn1 mask
-        l2_mask_f1 = l1_mask_f1[self.l2_b_idx.cuda().long(), self.l2_h_idx.cuda().long(), self.l2_w_idx.cuda().long(), :]
-        l2_mask_f2 = l1_mask_f2[self.l2_b_idx.cuda().long(), self.l2_h_idx.cuda().long(), self.l2_w_idx.cuda().long(), :]
+        l2_mask_f1 = l1_mask_f1[self.l2_b_idx.long(), self.l2_h_idx.long(), self.l2_w_idx.long(), :]
+        l2_mask_f2 = l1_mask_f2[self.l2_b_idx.long(), self.l2_h_idx.long(), self.l2_w_idx.long(), :]
         ####  the l3 select bn1 mask
-        l3_mask_f1 = l2_mask_f1[self.l3_b_idx.cuda().long(), self.l3_h_idx.cuda().long(), self.l3_w_idx.cuda().long(), :]
-        l3_mask_f2 = l2_mask_f2[self.l3_b_idx.cuda().long(), self.l3_h_idx.cuda().long(), self.l3_w_idx.cuda().long(), :]
+        l3_mask_f1 = l2_mask_f1[self.l3_b_idx.long(), self.l3_h_idx.long(), self.l3_w_idx.long(), :]
+        l3_mask_f2 = l2_mask_f2[self.l3_b_idx.long(), self.l3_h_idx.long(), self.l3_w_idx.long(), :]
 
         ###set conv
         input_points_f1 = torch.zeros_like(input_xyz_aug_proj_f1)
@@ -393,10 +417,13 @@ class translo_model(nn.Module):
         ### warp layer2 pose
 
         l2_xyz_f1 = torch.reshape(l2_xyz_proj_f1, [batch_size, -1, 3])
-        l2_xyz_bnc_q = torch.cat([torch.zeros([batch_size, self.out_H_list[2] * self.out_W_list[2], 1]).cuda(), l2_xyz_f1], dim=-1)
+        l2_xyz_bnc_q = torch.cat(
+            [torch.zeros([batch_size, self.out_H_list[2] * self.out_W_list[2], 1], device=device), l2_xyz_f1],
+            dim=-1,
+        )
 
         l2_flow_warped = mul_q_point(l2_q_coarse, l2_xyz_bnc_q, batch_size)
-        l2_flow_warped = torch.index_select(mul_point_q(l2_flow_warped, l2_q_inv, batch_size), 2, torch.LongTensor(range(1, 4)).cuda()) + l2_t_coarse
+        l2_flow_warped = torch.index_select(mul_point_q(l2_flow_warped, l2_q_inv, batch_size), 2, coord_idx) + l2_t_coarse
 
         l2_mask = torch.any(l2_xyz_f1 != 0, dim=-1, keepdim=True).to(torch.float32)
         l2_flow_warped = l2_flow_warped * l2_mask
@@ -440,10 +467,9 @@ class translo_model(nn.Module):
         l2_q_det_inv = inv_q(l2_q_det, batch_size)
         l2_t_det = self.conv2_l2(l2_points_f1_new_t)
 
-        l2_t_coarse_trans = torch.cat([torch.zeros([batch_size, 1, 1]).cuda(), l2_t_coarse], dim=-1)
+        l2_t_coarse_trans = torch.cat([torch.zeros([batch_size, 1, 1], device=device), l2_t_coarse], dim=-1)
         l2_t_coarse_trans = mul_q_point(l2_q_det, l2_t_coarse_trans, batch_size)
-        l2_t_coarse_trans = torch.index_select(mul_point_q(l2_t_coarse_trans, l2_q_det_inv, batch_size), 2,
-                                               torch.LongTensor(range(1, 4)).cuda())
+        l2_t_coarse_trans = torch.index_select(mul_point_q(l2_t_coarse_trans, l2_q_det_inv, batch_size), 2, coord_idx)
 
         l2_q = torch.squeeze(mul_point_q(l2_q_det, l2_q_coarse, batch_size), dim=1)
         l2_t = torch.squeeze(l2_t_coarse_trans + l2_t_det, dim=1)
@@ -456,9 +482,12 @@ class translo_model(nn.Module):
         ############# warp layer2 pose
 
         l1_xyz_f1 = torch.reshape(l1_xyz_proj_f1, [batch_size, -1, 3])
-        l1_xyz_bnc_q = torch.cat([torch.zeros([batch_size, self.out_H_list[1] * self.out_W_list[1], 1]).cuda(), l1_xyz_f1], dim=-1)
+        l1_xyz_bnc_q = torch.cat(
+            [torch.zeros([batch_size, self.out_H_list[1] * self.out_W_list[1], 1], device=device), l1_xyz_f1],
+            dim=-1,
+        )
         l1_flow_warped = mul_q_point(l1_q_coarse, l1_xyz_bnc_q, batch_size)
-        l1_flow_warped = torch.index_select(mul_point_q(l1_flow_warped, l1_q_inv, batch_size), 2, torch.LongTensor(range(1, 4)).cuda()) + l1_t_coarse
+        l1_flow_warped = torch.index_select(mul_point_q(l1_flow_warped, l1_q_inv, batch_size), 2, coord_idx) + l1_t_coarse
         l1_mask = torch.any(l1_xyz_f1 != 0, dim=-1, keepdim=True).to(torch.float32)
         l1_flow_warped = l1_flow_warped * l1_mask
 
@@ -498,11 +527,10 @@ class translo_model(nn.Module):
         l1_q_det_inv = inv_q(l1_q_det, batch_size)
         l1_t_det = self.conv2_l1(l1_points_f1_new_t)
 
-        l1_t_coarse_trans = torch.cat([torch.zeros([batch_size, 1, 1]).cuda(), l1_t_coarse], dim=-1)
+        l1_t_coarse_trans = torch.cat([torch.zeros([batch_size, 1, 1], device=device), l1_t_coarse], dim=-1)
         l1_t_coarse_trans = mul_q_point(l1_q_det, l1_t_coarse_trans, batch_size)
 
-        l1_t_coarse_trans = torch.index_select(mul_point_q(l1_t_coarse_trans, l1_q_det_inv, batch_size), 2,
-                                               torch.LongTensor(range(1, 4)).cuda())
+        l1_t_coarse_trans = torch.index_select(mul_point_q(l1_t_coarse_trans, l1_q_det_inv, batch_size), 2, coord_idx)
 
         l1_q = torch.squeeze(mul_point_q(l1_q_det, l1_q_coarse, batch_size), dim=1)
         l1_t = torch.squeeze(l1_t_coarse_trans + l1_t_det, dim=1)
@@ -521,10 +549,13 @@ class translo_model(nn.Module):
         ############# warp layer2 pose
 
         l0_xyz_f1 = torch.reshape(l0_xyz_proj_f1, [batch_size, -1, 3])
-        l0_xyz_bnc_q = torch.cat([torch.zeros([batch_size, self.out_H_list[0] * self.out_W_list[0], 1]).cuda(), l0_xyz_f1], dim=-1)
+        l0_xyz_bnc_q = torch.cat(
+            [torch.zeros([batch_size, self.out_H_list[0] * self.out_W_list[0], 1], device=device), l0_xyz_f1],
+            dim=-1,
+        )
 
         l0_flow_warped = mul_q_point(l0_q_coarse, l0_xyz_bnc_q, batch_size)
-        l0_flow_warped = torch.index_select(mul_point_q(l0_flow_warped, l0_q_inv, batch_size), 2, torch.LongTensor(range(1, 4)).cuda()) + l0_t_coarse
+        l0_flow_warped = torch.index_select(mul_point_q(l0_flow_warped, l0_q_inv, batch_size), 2, coord_idx) + l0_t_coarse
 
         l0_mask = torch.any(l0_xyz_f1 != 0, dim=-1, keepdim=True).to(torch.float32)
         l0_flow_warped = l0_flow_warped * l0_mask
@@ -564,10 +595,9 @@ class translo_model(nn.Module):
         l0_q_det_inv = inv_q(l0_q_det, batch_size)
         l0_t_det = self.conv2_l0(l0_points_f1_new_t)
 
-        l0_t_coarse_trans = torch.cat([torch.zeros([batch_size, 1, 1]).cuda(), l0_t_coarse], dim=-1)
+        l0_t_coarse_trans = torch.cat([torch.zeros([batch_size, 1, 1], device=device), l0_t_coarse], dim=-1)
         l0_t_coarse_trans = mul_q_point(l0_q_det, l0_t_coarse_trans, batch_size)
-        l0_t_coarse_trans = torch.index_select(mul_point_q(l0_t_coarse_trans, l0_q_det_inv, batch_size), 2,
-                                               torch.LongTensor(range(1, 4)).cuda())
+        l0_t_coarse_trans = torch.index_select(mul_point_q(l0_t_coarse_trans, l0_q_det_inv, batch_size), 2, coord_idx)
 
         l0_q = torch.squeeze(mul_point_q(l0_q_det, l0_q_coarse, batch_size), dim=1)
         l0_t = torch.squeeze(l0_t_coarse_trans + l0_t_det, dim=1)
