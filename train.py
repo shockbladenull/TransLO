@@ -155,7 +155,8 @@ def main():
         args.vertical_view_down,
     )
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+    if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
     model = translo_model(args, args.batch_size, args.H_input, args.W_input, args.is_training)
 
@@ -231,21 +232,16 @@ def main():
         optimizer.zero_grad()
 
         for i, data in tqdm(enumerate(train_loader, 0), total=len(train_loader), smoothing=0.9):
-            torch.cuda.synchronize()
             pos2, pos1, sample_id, T_gt, T_trans, T_trans_inv, Tr = move_batch_to_cuda(data)
-            torch.cuda.synchronize()
             model = model.train()
-            torch.cuda.synchronize()
             l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, pc1_ouput, q_gt, t_gt, w_x, w_q = model(
                 pos2, pos1, T_gt, T_trans, T_trans_inv
             )
             loss = get_loss(l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, q_gt, t_gt, w_x, w_q)
-            torch.cuda.synchronize()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            torch.cuda.synchronize()
 
             current_batch_size = len(pos2)
             if args.multi_gpu is not None:
@@ -299,21 +295,17 @@ def eval_pose(model, test_list, epoch):
         total_time = 0
 
         for batch_id, data in tqdm(enumerate(test_loader), total=len(test_loader), smoothing=0.9):
-            torch.cuda.synchronize()
             pos2, pos1, sample_id, T_gt, T_trans, T_trans_inv, Tr = move_batch_to_cuda(data)
-            torch.cuda.synchronize()
 
             model = model.eval()
 
             with torch.no_grad():
-                torch.cuda.synchronize()
                 start_time = time.time()
 
                 l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, pc1_ouput, q_gt, t_gt, w_x, w_q = model(
                     pos2, pos1, T_gt, T_trans, T_trans_inv
                 )
 
-                torch.cuda.synchronize()
                 total_time += (time.time() - start_time)
 
                 pc1_sample_2048 = pc1_ouput.cpu()

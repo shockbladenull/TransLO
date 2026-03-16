@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import time
 import numpy as np
 from conv_util import PointNetSaModule, cost_volume, set_upconv_module, FlowPredictor, Conv1d
 from translo_model_utils import ProjectPCimg2SphericalRing, PreProcess, mat2euler, euler2quat, \
@@ -267,11 +266,8 @@ class translo_model(nn.Module):
 
 
     def forward(self, input_xyz_f1, input_xyz_f2, T_gt, T_trans, T_trans_inv):
-        start_train = time.time()
 
         batch_size = len(input_xyz_f1)
-        torch.cuda.synchronize()
-        start_time = time.time()
 
         aug_frame = np.random.choice([1, 2], size = batch_size, replace = True) # random choose aug frame 1 or 2
         input_xyz_aug_f1, input_xyz_aug_f2, q_gt, t_gt = PreProcess(input_xyz_f1, input_xyz_f2, T_gt, T_trans, T_trans_inv, aug_frame)
@@ -328,7 +324,6 @@ class translo_model(nn.Module):
         l3_mask_f2 = l2_mask_f2[self.l3_b_idx.cuda().long(), self.l3_h_idx.cuda().long(), self.l3_w_idx.cuda().long(), :]
 
         ###set conv
-        set_conv_start = time.time()
         input_points_f1 = torch.zeros_like(input_xyz_aug_proj_f1)
         input_points_f2 = torch.zeros_like(input_xyz_aug_proj_f2)
         # Flame 1
@@ -454,7 +449,6 @@ class translo_model(nn.Module):
         l2_t = torch.squeeze(l2_t_coarse_trans + l2_t_det, dim=1)
 
         ############# layer1
-        start_l1_refine = time.time()
         l1_q_coarse = torch.reshape(l2_q, [batch_size, 1, -1])
         l1_t_coarse = torch.reshape(l2_t, [batch_size, 1, -1])
         l1_q_inv = inv_q(l1_q_coarse, batch_size)
