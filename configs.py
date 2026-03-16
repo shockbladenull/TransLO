@@ -93,13 +93,30 @@ def translonet_args():
     parser.add_argument('--image_root', default='/dataset/data_odometry_color', help='Dataset directory [default: /dataset]')
     parser.add_argument('--oxford_root', default=None, help='QEOxford dataset root')
     parser.add_argument('--oxford_h5_name', default='velodyne_left_calibrateFalse.h5',
-                        help='QEOxford pose file name')
+                        help='QEOxford H5 file used for timestamps and, when pose_source=h5, poses')
+    parser.add_argument('--oxford_h5_root', default=None,
+                        help='Optional root directory containing oxford_h5_name sequence folders')
+    parser.add_argument('--oxford_pose_source', choices=['h5', 'txt'], default='h5',
+                        help='Read Oxford poses from the selected H5 or an external TXT trajectory')
+    parser.add_argument('--oxford_full_h5_name', default='velodyne_left_calibrateFalse.h5',
+                        help='Full-sequence Oxford H5 used to align TXT poses onto the LiDAR timeline')
+    parser.add_argument('--oxford_full_h5_root', default=None,
+                        help='Optional root directory containing oxford_full_h5_name sequence folders')
+    parser.add_argument('--oxford_pose_root', default=None,
+                        help='Root directory containing Oxford TXT pose files; defaults to oxford_root')
+    parser.add_argument('--oxford_pose_txt_template',
+                        default='Oxford_SLAM_result_{sequence_short}/gicp_Oxford{sequence_short}_050_v1.txt',
+                        help='TXT pose path template relative to oxford_pose_root')
+    parser.add_argument('--oxford_pose_skip_start', type=int, default=5,
+                        help='Skip N full-H5 timestamps from the front before aligning TXT poses')
+    parser.add_argument('--oxford_pose_skip_end', type=int, default=5,
+                        help='Skip N full-H5 timestamps from the back before aligning TXT poses')
     parser.add_argument('--oxford_train_seqs', nargs='+', default=list(DEFAULT_OXFORD_TRAIN_SEQS),
                         help='QEOxford training sequences')
     parser.add_argument('--oxford_val_seqs', nargs='+', default=list(DEFAULT_OXFORD_VAL_SEQS),
                         help='QEOxford validation sequences')
-    parser.add_argument('--oxford_trim_edges', type=int, default=5,
-                        help='Drop N valid timestamps from both ends of each Oxford sequence')
+    parser.add_argument('--oxford_trim_edges', type=int, default=None,
+                        help='Additional trim applied after timestamps and poses are aligned')
     parser.add_argument('--frame_gap', type=int, default=1,
                         help='Temporal gap used to form relative pose pairs')
     parser.add_argument('--kitti_train_seqs', nargs='+', type=int, default=list(DEFAULT_KITTI_TRAIN_SEQS),
@@ -164,5 +181,7 @@ def translonet_args():
     args.kitti_test_seqs = _normalize_list_arg(args.kitti_test_seqs, int)
     args.oxford_train_seqs = _normalize_list_arg(args.oxford_train_seqs, str)
     args.oxford_val_seqs = _normalize_list_arg(args.oxford_val_seqs, str)
+    if args.oxford_trim_edges is None:
+        args.oxford_trim_edges = 0 if args.oxford_pose_source == 'txt' else 5
     args = _resolve_sensor_profile(args)
     return args
