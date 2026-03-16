@@ -1,6 +1,8 @@
 # -*- coding:UTF-8 -*-
 
+import csv
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -36,6 +38,27 @@ SOURCE_BACKUP_FILES = (
     'translo_model_utils.py',
     'conv_util.py',
     'kitti_pytorch.py',
+)
+
+PROGRESS_UPDATE_INTERVAL = 10
+METRIC_FIELDS = (
+    'timestamp',
+    'phase',
+    'epoch',
+    'total_epochs',
+    'loss',
+    'translation_error',
+    'rotation_error_deg',
+    'lr',
+    'epoch_time_sec',
+    'avg_data_time_sec',
+    'avg_iter_time_sec',
+    'samples_per_sec',
+    'global_samples',
+    'avg_points',
+    'gpu_mem_gb',
+    'gpu_peak_mem_gb',
+    'notes',
 )
 
 
@@ -164,22 +187,96 @@ def quaternion_angle_error_deg(pred_q, gt_q):
     return (2.0 * torch.acos(dot)) * (180.0 / np.pi)
 
 
-def reduce_epoch_stats(loss_sum, total_seen):
+def reduce_tensor(tensor, op=dist.ReduceOp.SUM):
     if is_distributed():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_seen, op=dist.ReduceOp.SUM)
-    return float((loss_sum / total_seen.clamp_min(1)).item())
+        dist.all_reduce(tensor, op=op)
+    return tensor
 
 
-def validate_oxford(model, val_loader, epoch, logger):
+def format_duration(seconds):
+    total_seconds = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return '{:d}:{:02d}:{:02d}'.format(hours, minutes, secs)
+    return '{:02d}:{:02d}'.format(minutes, secs)
+
+
+def mean_points_in_batch(point_batches):
+    if not point_batches:
+        return 0.0
+    return float(sum(batch.shape[0] for batch in point_batches) / len(point_batches))
+
+
+def safe_gpu_memory_stats(device):
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return 0.0, 0.0
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    current_mem = torch.cuda.memory_allocated(device_index) / (1024 ** 3)
+    peak_mem = torch.cuda.max_memory_allocated(device_index) / (1024 ** 3)
+    return current_mem, peak_mem
+
+
+def init_metric_logs(log_dir):
+    if not is_main_process():
+        return None
+
+    csv_path = os.path.join(log_dir, 'metrics.csv')
+    jsonl_path = os.path.join(log_dir, 'metrics.jsonl')
+
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        with open(csv_path, 'w', newline='') as handle:
+            csv.DictWriter(handle, fieldnames=METRIC_FIELDS).writeheader()
+
+    if not os.path.exists(jsonl_path):
+        open(jsonl_path, 'a').close()
+
+    return {
+        'csv': csv_path,
+        'jsonl': jsonl_path,
+    }
+
+
+def append_metric_record(metric_logs, **record):
+    if metric_logs is None or not is_main_process():
+        return
+
+    row = {field: record.get(field, '') for field in METRIC_FIELDS}
+    with open(metric_logs['csv'], 'a', newline='') as handle:
+        csv.DictWriter(handle, fieldnames=METRIC_FIELDS).writerow(row)
+    with open(metric_logs['jsonl'], 'a') as handle:
+        handle.write(json.dumps(row) + '\n')
+
+
+def validate_oxford(model, val_loader, epoch, total_epochs, logger, metric_logs=None, lr=''):
     total_loss = torch.zeros(1, device=args.device, dtype=torch.float64)
     total_trans_error = torch.zeros(1, device=args.device, dtype=torch.float64)
     total_rot_error = torch.zeros(1, device=args.device, dtype=torch.float64)
     total_seen = torch.zeros(1, device=args.device, dtype=torch.float64)
+    total_points = torch.zeros(1, device=args.device, dtype=torch.float64)
+    total_data_time = torch.zeros(1, device=args.device, dtype=torch.float64)
+    total_iter_time = torch.zeros(1, device=args.device, dtype=torch.float64)
+    total_steps = torch.zeros(1, device=args.device, dtype=torch.float64)
 
     model.eval()
+    if args.device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(args.device)
+
+    val_start = time.time()
+    previous_step_end = val_start
+    progress = tqdm(
+        val_loader,
+        total=len(val_loader),
+        smoothing=0.1,
+        desc='Val {:03d}/{:03d}'.format(epoch, total_epochs),
+        dynamic_ncols=True,
+        leave=False,
+        disable=not is_main_process(),
+    )
     with torch.no_grad():
-        for data in tqdm(val_loader, total=len(val_loader), smoothing=0.9):
+        for step, data in enumerate(progress, 1):
+            iter_start = time.time()
+            data_time = iter_start - previous_step_end
             pos2, pos1, _, T_gt, T_trans, T_trans_inv, _ = move_batch_to_device(data)
             l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, _, q_gt, t_gt, w_x, w_q = model(
                 pos2, pos1, T_gt, T_trans, T_trans_inv
@@ -193,10 +290,27 @@ def validate_oxford(model, val_loader, epoch, logger):
             rot_error = quaternion_angle_error_deg(l0_q, q_gt)
 
             batch_size = l0_q.shape[0]
+            iter_end = time.time()
+            iter_time = iter_end - iter_start
+
             total_loss += loss.detach().to(torch.float64) * batch_size
             total_trans_error += trans_error.sum().to(torch.float64)
             total_rot_error += rot_error.sum().to(torch.float64)
             total_seen += batch_size
+            total_points += mean_points_in_batch(pos2) * batch_size
+            total_data_time += data_time
+            total_iter_time += iter_time
+            total_steps += 1
+
+            if is_main_process() and (step % PROGRESS_UPDATE_INTERVAL == 0 or step == len(val_loader)):
+                denom = total_seen.clamp_min(1.0)
+                progress.set_postfix(
+                    loss='{:.4f}'.format((total_loss / denom).item()),
+                    trans='{:.4f}m'.format((total_trans_error / denom).item()),
+                    rot='{:.3f}deg'.format((total_rot_error / denom).item()),
+                    iter='{:.2f}s'.format(iter_time),
+                )
+            previous_step_end = iter_end
 
     if total_seen.item() == 0:
         raise RuntimeError('Oxford validation loader is empty')
@@ -204,11 +318,48 @@ def validate_oxford(model, val_loader, epoch, logger):
     val_loss = float((total_loss / total_seen).item())
     val_trans = float((total_trans_error / total_seen).item())
     val_rot = float((total_rot_error / total_seen).item())
+    val_time_sec = time.time() - val_start
+    avg_data_time_sec = float((total_data_time / total_steps.clamp_min(1.0)).item())
+    avg_iter_time_sec = float((total_iter_time / total_steps.clamp_min(1.0)).item())
+    avg_points = float((total_points / total_seen.clamp_min(1.0)).item())
+    gpu_mem_gb, gpu_peak_mem_gb = safe_gpu_memory_stats(args.device)
+    samples_per_sec = float(total_seen.item() / max(val_time_sec, 1e-6))
     log_message(
         logger,
-        'EPOCH {} val mean loss: {:.6f}, translation error: {:.6f} m, rotation error: {:.6f} deg'.format(
-            epoch, val_loss, val_trans, val_rot
+        'EPOCH {:03d}/{:03d} val loss: {:.6f} | trans: {:.6f} m | rot: {:.6f} deg | '
+        'time: {} | data: {:.2f}s | iter: {:.2f}s | ips: {:.2f} | pts: {:.1f}k | mem: {:.2f}/{:.2f}G'.format(
+            epoch,
+            total_epochs,
+            val_loss,
+            val_trans,
+            val_rot,
+            format_duration(val_time_sec),
+            avg_data_time_sec,
+            avg_iter_time_sec,
+            samples_per_sec,
+            avg_points / 1000.0,
+            gpu_mem_gb,
+            gpu_peak_mem_gb,
         ),
+    )
+    append_metric_record(
+        metric_logs,
+        timestamp=datetime.datetime.now().isoformat(timespec='seconds'),
+        phase='val',
+        epoch=epoch,
+        total_epochs=total_epochs,
+        loss=round(val_loss, 6),
+        translation_error=round(val_trans, 6),
+        rotation_error_deg=round(val_rot, 6),
+        lr=lr,
+        epoch_time_sec=round(val_time_sec, 3),
+        avg_data_time_sec=round(avg_data_time_sec, 4),
+        avg_iter_time_sec=round(avg_iter_time_sec, 4),
+        samples_per_sec=round(samples_per_sec, 3),
+        global_samples=int(total_seen.item()),
+        avg_points=round(avg_points, 1),
+        gpu_mem_gb=round(gpu_mem_gb, 3),
+        gpu_peak_mem_gb=round(gpu_peak_mem_gb, 3),
     )
     return {
         'loss': val_loss,
@@ -229,7 +380,15 @@ def eval_pose(model, test_list, epoch, log_dir, eval_dir, logger):
         line = 0
         total_time = 0.0
 
-        for _, data in tqdm(enumerate(test_loader), total=len(test_loader), smoothing=0.9):
+        for _, data in tqdm(
+            enumerate(test_loader),
+            total=len(test_loader),
+            smoothing=0.1,
+            desc='Eval seq {} e{:03d}'.format(str(item).zfill(2), epoch),
+            dynamic_ncols=True,
+            leave=False,
+            disable=not is_main_process(),
+        ):
             pos2, pos1, sample_id, T_gt, T_trans, T_trans_inv, Tr = move_batch_to_device(data)
 
             model.eval()
@@ -294,6 +453,8 @@ def main():
     setup_runtime()
     file_dir, eval_dir, log_dir, checkpoints_dir = prepare_output_dirs()
     logger = creat_logger(log_dir, args.model_name) if is_main_process() else None
+    metric_logs = init_metric_logs(log_dir)
+    total_epochs = max(args.max_epoch - 1, 0)
 
     if logger is not None:
         logger.info('----------------------------------------TRAINING----------------------------------')
@@ -370,8 +531,18 @@ def main():
     if args.eval_before == 1:
         if is_main_process():
             if val_loader is not None:
-                validate_oxford(unwrap_model(model), val_loader, init_epoch, logger)
+                log_message(logger, 'Epoch {:03d}: running validation before training'.format(init_epoch))
+                validate_oxford(
+                    unwrap_model(model),
+                    val_loader,
+                    init_epoch,
+                    total_epochs,
+                    logger,
+                    metric_logs=metric_logs,
+                    lr='{:.6e}'.format(optimizer.param_groups[0]['lr']),
+                )
             else:
+                log_message(logger, 'Epoch {:03d}: running KITTI evaluation before training'.format(init_epoch))
                 eval_pose(unwrap_model(model), args.kitti_val_seqs, init_epoch, log_dir, eval_dir, logger)
                 excel_eval.update(eval_dir)
         barrier()
@@ -381,10 +552,30 @@ def main():
             train_sampler.set_epoch(epoch)
 
         model.train()
-        total_loss = torch.zeros(1, device=args.device, dtype=torch.float64)
-        total_seen = torch.zeros(1, device=args.device, dtype=torch.float64)
+        if args.device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats(args.device)
 
-        for data in tqdm(train_loader, total=len(train_loader), smoothing=0.9, disable=not is_main_process()):
+        epoch_loss_sum = 0.0
+        epoch_seen = 0.0
+        epoch_points_sum = 0.0
+        epoch_data_time_sum = 0.0
+        epoch_iter_time_sum = 0.0
+        epoch_steps = 0.0
+        epoch_start = time.time()
+        previous_step_end = epoch_start
+        progress = tqdm(
+            train_loader,
+            total=len(train_loader),
+            smoothing=0.1,
+            desc='Epoch {:03d}/{:03d}'.format(epoch, total_epochs),
+            dynamic_ncols=True,
+            leave=False,
+            disable=not is_main_process(),
+        )
+
+        for step, data in enumerate(progress, 1):
+            iter_start = time.time()
+            data_time = iter_start - previous_step_end
             pos2, pos1, sample_id, T_gt, T_trans, T_trans_inv, Tr = move_batch_to_device(data)
             optimizer.zero_grad()
 
@@ -396,16 +587,110 @@ def main():
             optimizer.step()
 
             current_batch_size = len(pos2)
-            total_loss += loss.detach().to(torch.float64) * current_batch_size
-            total_seen += current_batch_size
+            batch_points = mean_points_in_batch(pos2)
+            loss_value = float(loss.detach().item())
+            iter_end = time.time()
+            iter_time = iter_end - iter_start
+
+            epoch_loss_sum += loss_value * current_batch_size
+            epoch_seen += current_batch_size
+            epoch_points_sum += batch_points * current_batch_size
+            epoch_data_time_sum += data_time
+            epoch_iter_time_sum += iter_time
+            epoch_steps += 1
+
+            if is_main_process() and (step % PROGRESS_UPDATE_INTERVAL == 0 or step == len(train_loader)):
+                avg_loss = epoch_loss_sum / max(epoch_seen, 1.0)
+                current_mem_gb, peak_mem_gb = safe_gpu_memory_stats(args.device)
+                progress.set_postfix(
+                    loss='{:.4f}'.format(loss_value),
+                    avg='{:.4f}'.format(avg_loss),
+                    lr='{:.2e}'.format(optimizer.param_groups[0]['lr']),
+                    data='{:.2f}s'.format(data_time),
+                    iter='{:.2f}s'.format(iter_time),
+                    ips='{:.1f}'.format((current_batch_size * args.world_size) / max(iter_time, 1e-6)),
+                    pts='{:.1f}k'.format(batch_points / 1000.0),
+                    mem='{:.2f}/{:.2f}G'.format(current_mem_gb, peak_mem_gb),
+                )
+            previous_step_end = iter_end
 
         scheduler.step()
         lr = max(optimizer.param_groups[0]['lr'], args.learning_rate_clip)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        train_loss = reduce_epoch_stats(total_loss, total_seen)
-        log_message(logger, 'EPOCH {} train mean loss: {:04f}'.format(epoch, train_loss))
+        current_mem_gb, peak_mem_gb = safe_gpu_memory_stats(args.device)
+        reduced_sums = reduce_tensor(
+            torch.tensor(
+                [
+                    epoch_loss_sum,
+                    epoch_seen,
+                    epoch_points_sum,
+                    epoch_data_time_sum,
+                    epoch_iter_time_sum,
+                    epoch_steps,
+                ],
+                device=args.device,
+                dtype=torch.float64,
+            )
+        )
+        reduced_max = reduce_tensor(
+            torch.tensor(
+                [
+                    time.time() - epoch_start,
+                    current_mem_gb,
+                    peak_mem_gb,
+                ],
+                device=args.device,
+                dtype=torch.float64,
+            ),
+            op=dist.ReduceOp.MAX,
+        )
+
+        train_loss = float(reduced_sums[0].item() / max(reduced_sums[1].item(), 1.0))
+        avg_points = float(reduced_sums[2].item() / max(reduced_sums[1].item(), 1.0))
+        avg_data_time_sec = float(reduced_sums[3].item() / max(reduced_sums[5].item(), 1.0))
+        avg_iter_time_sec = float(reduced_sums[4].item() / max(reduced_sums[5].item(), 1.0))
+        global_samples = int(reduced_sums[1].item())
+        epoch_time_sec = float(reduced_max[0].item())
+        gpu_mem_gb = float(reduced_max[1].item())
+        gpu_peak_mem_gb = float(reduced_max[2].item())
+        samples_per_sec = global_samples / max(epoch_time_sec, 1e-6)
+
+        log_message(
+            logger,
+            'EPOCH {:03d}/{:03d} train loss: {:.6f} | lr: {:.6e} | time: {} | data: {:.2f}s | '
+            'iter: {:.2f}s | ips: {:.2f} | pts: {:.1f}k | mem: {:.2f}/{:.2f}G'.format(
+                epoch,
+                total_epochs,
+                train_loss,
+                lr,
+                format_duration(epoch_time_sec),
+                avg_data_time_sec,
+                avg_iter_time_sec,
+                samples_per_sec,
+                avg_points / 1000.0,
+                gpu_mem_gb,
+                gpu_peak_mem_gb,
+            ),
+        )
+        append_metric_record(
+            metric_logs,
+            timestamp=datetime.datetime.now().isoformat(timespec='seconds'),
+            phase='train',
+            epoch=epoch,
+            total_epochs=total_epochs,
+            loss=round(train_loss, 6),
+            lr='{:.6e}'.format(lr),
+            epoch_time_sec=round(epoch_time_sec, 3),
+            avg_data_time_sec=round(avg_data_time_sec, 4),
+            avg_iter_time_sec=round(avg_iter_time_sec, 4),
+            samples_per_sec=round(samples_per_sec, 3),
+            global_samples=global_samples,
+            avg_points=round(avg_points, 1),
+            gpu_mem_gb=round(gpu_mem_gb, 3),
+            gpu_peak_mem_gb=round(gpu_peak_mem_gb, 3),
+        )
 
         if epoch % 5 == 0:
             barrier()
@@ -424,11 +709,21 @@ def main():
                     },
                     save_path,
                 )
-                log_message(logger, 'Save {}...'.format(model_name))
+                log_message(logger, 'Epoch {:03d}: saved checkpoint {}'.format(epoch, os.path.basename(save_path)))
 
                 if val_loader is not None:
-                    validate_oxford(unwrap_model(model), val_loader, epoch, logger)
+                    log_message(logger, 'Epoch {:03d}: starting Oxford validation'.format(epoch))
+                    validate_oxford(
+                        unwrap_model(model),
+                        val_loader,
+                        epoch,
+                        total_epochs,
+                        logger,
+                        metric_logs=metric_logs,
+                        lr='{:.6e}'.format(lr),
+                    )
                 else:
+                    log_message(logger, 'Epoch {:03d}: starting KITTI evaluation'.format(epoch))
                     eval_pose(unwrap_model(model), args.kitti_val_seqs, epoch, log_dir, eval_dir, logger)
                     excel_eval.update(eval_dir)
             barrier()
