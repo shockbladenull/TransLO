@@ -78,7 +78,7 @@ def is_main_process():
 
 def barrier():
     if is_distributed():
-        dist.barrier()
+        dist.barrier(device_ids=[args.local_rank])
 
 
 def unwrap_model(model):
