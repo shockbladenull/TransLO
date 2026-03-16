@@ -14,7 +14,7 @@ import numpy as np
 """
 
 
-def limited_points(points: np.float, npoints: int = 8192, fov_filter: bool = False) -> np.float:
+def limited_points(points: np.ndarray, npoints: int = 8192, fov_filter: bool = False) -> np.ndarray:
     """
 
     :param points: 原点云
@@ -50,7 +50,7 @@ def limited_points(points: np.float, npoints: int = 8192, fov_filter: bool = Fal
     return points[sample_idx]
 
 
-def filter_points(points: np.float, npoints: int = 8192, fov_filter=True, furthest: int = 40) -> np.float:
+def filter_points(points: np.ndarray, npoints: int = 8192, fov_filter=True, furthest: int = 40) -> np.ndarray:
     """
 
     :param points: 相机坐标系下的点云，np.array [n,3] or [n,4]

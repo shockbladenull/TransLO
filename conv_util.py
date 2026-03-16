@@ -485,7 +485,7 @@ class set_upconv_module(nn.Module):
                 self.mlp_conv.append(Conv2d(self.last_channel,num_out_channel,[1,1],stride=[1,1], bn=True ))
                 self.last_channel = num_out_channel
 
-        if len(mlp) is not 0:
+        if len(mlp) != 0:
             self.last_channel = mlp[-1] + in_channels[0]
         else:
             self.last_channel = self.last_channel + in_channels[0]
@@ -645,4 +645,3 @@ def conv3x3(in_planes, out_planes, stride = 1):
     return nn.Conv2d(in_planes, out_planes, kernel_size = 3, stride = stride,
                      padding = 1, bias = False)
 BatchNorm2d = nn.BatchNorm2d
-
