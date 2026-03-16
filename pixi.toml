@@ -1,0 +1,41 @@
+[workspace]
+name = "translo"
+version = "0.1.0"
+description = "Pixi environment for TransLO"
+channels = ["pytorch", "nvidia", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.10.*"
+pytorch = "2.5.*"
+pytorch-cuda = "12.1.*"
+numpy = "1.26.*"
+scipy = "1.14.*"
+pyyaml = "6.*"
+tqdm = "4.*"
+openpyxl = "3.*"
+matplotlib = "3.9.*"
+setuptools = "75.*"
+pip = "24.*"
+ninja = "1.12.*"
+
+[pypi-dependencies]
+h5py = "==3.11.0"
+
+[tasks.build-pointnet2]
+cmd = "python setup.py install"
+cwd = "pointnet2"
+
+[tasks.build-fused-random]
+cmd = "python setup.py install"
+cwd = "ops_pytorch/fused_conv_random_k"
+
+[tasks.build-fused-select]
+cmd = "python setup.py install"
+cwd = "ops_pytorch/fused_conv_select_k"
+
+[tasks.build-extensions]
+depends-on = ["build-pointnet2", "build-fused-random", "build-fused-select"]
+
+[tasks.smoke-test]
+cmd = "python -c \"import torch; import pointnet2_cuda; import fused_conv_random_k_cuda; import fused_conv_select_k_cuda; print(torch.__version__)\""
