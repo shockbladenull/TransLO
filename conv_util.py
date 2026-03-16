@@ -359,7 +359,7 @@ class cost_volume(nn.Module):
 
         valid_mask_bool = torch.eq(valid_mask, torch.ones_like(valid_mask))
         WQ_mask = valid_mask_bool.expand(B, H*W, self.nsample_q, pi_concat.shape[-1])                  #  B N K MLP[-1]     
-        pi_concat_mask = torch.where(WQ_mask, pi_concat, torch.ones_like(pi_concat) * (-1e10)) 
+        pi_concat_mask = torch.where(WQ_mask, pi_concat, torch.ones_like(pi_concat) * (-1e10))
         WQ = F.softmax(pi_concat_mask, dim=2)
 
         # First Attentive Flow Embedding e(M) ---  w(Q) * h(Q)
@@ -429,9 +429,9 @@ class cost_volume(nn.Module):
         for j,conv in enumerate(self.mlp2_convs_new):
             pc_concat = conv(pc_concat)
 
-        valid_mask2_bool = torch.eq(valid_mask2, torch.ones_like(valid_mask2)) 
+        valid_mask2_bool = torch.eq(valid_mask2, torch.ones_like(valid_mask2))
         WP_mask = valid_mask2_bool.expand(B, H*W, self.nsample, pc_concat.shape[-1])   ####   B N K MLP[-1]    #####################  
-        pc_concat_mask = torch.where(WP_mask, pc_concat, torch.ones_like(pc_concat) * (-1e10)) 
+        pc_concat_mask = torch.where(WP_mask, pc_concat, torch.ones_like(pc_concat) * (-1e10))
         WP = F.softmax(pc_concat_mask,dim=2)   #####  b, npoints, nsample, mlp[-1]
 
         # Final Attentive Flow Embedding --- w(M) * xyz1(M) 
