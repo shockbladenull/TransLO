@@ -13,12 +13,9 @@ DEFAULT_KITTI_TEST_SEQS = [7, 8, 9, 10]
 
 DEFAULT_OXFORD_TRAIN_SEQS = [
     "2019-01-11-14-02-26-radar-oxford-10k",
-    "2019-01-14-12-05-52-radar-oxford-10k",
-    "2019-01-14-14-48-55-radar-oxford-10k",
-    "2019-01-18-15-20-12-radar-oxford-10k",
 ]
 DEFAULT_OXFORD_VAL_SEQS = [
-    "2019-01-15-13-06-37-radar-oxford-10k",
+    "2019-01-14-12-05-52-radar-oxford-10k",
 ]
 
 SENSOR_PROFILES = {
@@ -81,6 +78,8 @@ def translonet_args():
     parser.add_argument('--batch_size', type=int, default=8, help='Batch Size during training [default: 16]')
     parser.add_argument('--eval_batch_size', type=int, default=8, help='Batch Size during evaling [default: 64]')
     parser.add_argument('--eval_before', type=int, default=0, help='if 1, eval before train')
+    parser.add_argument('--save_eval_interval', type=int, default=2,
+                        help='Save checkpoints and run validation every N epochs')
 
     parser.add_argument('--train_dataset_type', choices=['kitti', 'oxford_qe'], default='kitti',
                         help='Dataset used for training')
@@ -183,5 +182,7 @@ def translonet_args():
     args.oxford_val_seqs = _normalize_list_arg(args.oxford_val_seqs, str)
     if args.oxford_trim_edges is None:
         args.oxford_trim_edges = 0 if args.oxford_pose_source == 'txt' else 5
+    if args.save_eval_interval <= 0:
+        raise ValueError('--save_eval_interval must be a positive integer')
     args = _resolve_sensor_profile(args)
     return args

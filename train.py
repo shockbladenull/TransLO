@@ -776,8 +776,10 @@ def main():
                     },
                     epoch,
                 )
+                if should_log_histograms(epoch):
+                    log_model_histograms(tb_writer, unwrap_model(model).named_parameters(), epoch)
 
-            if epoch % 5 == 0:
+            if epoch % args.save_eval_interval == 0:
                 barrier()
                 if is_main_process():
                     model_name = unwrap_model(model).__class__.__name__
@@ -795,8 +797,6 @@ def main():
                         save_path,
                     )
                     log_message(logger, 'Epoch {:03d}: saved checkpoint {}'.format(epoch, os.path.basename(save_path)))
-                    if should_log_histograms(epoch):
-                        log_model_histograms(tb_writer, unwrap_model(model).named_parameters(), epoch)
 
                     if val_loader is not None:
                         log_message(logger, 'Epoch {:03d}: starting Oxford validation'.format(epoch))
