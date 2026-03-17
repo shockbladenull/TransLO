@@ -312,6 +312,16 @@ def validate_oxford(model, val_loader, epoch, total_epochs, logger, metric_logs=
                 )
             previous_step_end = iter_end
 
+    if is_distributed():
+        total_loss = reduce_tensor(total_loss)
+        total_trans_error = reduce_tensor(total_trans_error)
+        total_rot_error = reduce_tensor(total_rot_error)
+        total_seen = reduce_tensor(total_seen)
+        total_points = reduce_tensor(total_points)
+        total_data_time = reduce_tensor(total_data_time)
+        total_iter_time = reduce_tensor(total_iter_time)
+        total_steps = reduce_tensor(total_steps)
+
     if total_seen.item() == 0:
         raise RuntimeError('Oxford validation loader is empty')
 
@@ -483,15 +493,19 @@ def main():
     log_message(logger, 'Train dataset: %s (%d samples)' % (args.train_dataset_type, len(train_dataset)))
 
     val_loader = None
+    val_sampler = None
     excel_eval = None
-    if is_main_process():
-        if args.val_dataset_type == 'oxford_qe':
-            val_dataset = build_dataset('val', args, is_training=0)
-            val_loader = make_dataloader(val_dataset, args.eval_batch_size, shuffle=False)
+    if args.val_dataset_type == 'oxford_qe':
+        val_dataset = build_dataset('val', args, is_training=0)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed() else None
+        val_loader = make_dataloader(val_dataset, args.eval_batch_size, shuffle=False, sampler=val_sampler)
+        if is_main_process():
             log_message(logger, 'Validation dataset: %s (%d samples)' % (args.val_dataset_type, len(val_dataset)))
-        else:
+    elif is_main_process():
+        if args.val_dataset_type != 'oxford_qe':
             excel_eval = SaveExcel(args.kitti_val_seqs, log_dir)
             log_message(logger, 'Validation dataset: %s (%s)' % (args.val_dataset_type, args.kitti_val_seqs))
+    if is_main_process():
         log_message(logger, 'KITTI test sequences kept unchanged: {}'.format(args.kitti_test_seqs))
 
     if args.optimizer == 'SGD':
@@ -529,19 +543,20 @@ def main():
     barrier()
 
     if args.eval_before == 1:
-        if is_main_process():
-            if val_loader is not None:
+        if val_loader is not None:
+            if is_main_process():
                 log_message(logger, 'Epoch {:03d}: running validation before training'.format(init_epoch))
-                validate_oxford(
-                    unwrap_model(model),
-                    val_loader,
-                    init_epoch,
-                    total_epochs,
-                    logger,
-                    metric_logs=metric_logs,
-                    lr='{:.6e}'.format(optimizer.param_groups[0]['lr']),
-                )
-            else:
+            validate_oxford(
+                unwrap_model(model),
+                val_loader,
+                init_epoch,
+                total_epochs,
+                logger,
+                metric_logs=metric_logs,
+                lr='{:.6e}'.format(optimizer.param_groups[0]['lr']),
+            )
+        elif is_main_process():
+            if val_loader is None:
                 log_message(logger, 'Epoch {:03d}: running KITTI evaluation before training'.format(init_epoch))
                 eval_pose(unwrap_model(model), args.kitti_val_seqs, init_epoch, log_dir, eval_dir, logger)
                 excel_eval.update(eval_dir)
@@ -713,19 +728,20 @@ def main():
 
                 if val_loader is not None:
                     log_message(logger, 'Epoch {:03d}: starting Oxford validation'.format(epoch))
-                    validate_oxford(
-                        unwrap_model(model),
-                        val_loader,
-                        epoch,
-                        total_epochs,
-                        logger,
-                        metric_logs=metric_logs,
-                        lr='{:.6e}'.format(lr),
-                    )
                 else:
                     log_message(logger, 'Epoch {:03d}: starting KITTI evaluation'.format(epoch))
                     eval_pose(unwrap_model(model), args.kitti_val_seqs, epoch, log_dir, eval_dir, logger)
                     excel_eval.update(eval_dir)
+            if val_loader is not None:
+                validate_oxford(
+                    unwrap_model(model),
+                    val_loader,
+                    epoch,
+                    total_epochs,
+                    logger,
+                    metric_logs=metric_logs,
+                    lr='{:.6e}'.format(lr),
+                )
             barrier()
 
 
