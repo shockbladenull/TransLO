@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torch.utils.data
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from configs import translonet_args
@@ -22,6 +23,12 @@ from kitti_pytorch import points_dataset
 from tools.excel_tools import SaveExcel
 from tools.euler_tools import quat2mat
 from tools.logger_tools import creat_logger, log_print
+from tools.tensorboard_tools import (
+    log_model_histograms,
+    log_scalar_group,
+    should_log_histograms,
+    train_global_step,
+)
 from translo_model import get_loss, translo_model
 from utils1.collate_functions import collate_pair
 
@@ -145,16 +152,17 @@ def prepare_output_dirs():
 
     eval_dir = os.path.join(file_dir, 'eval')
     log_dir = os.path.join(file_dir, 'logs')
+    tensorboard_dir = os.path.join(file_dir, 'tensorboard')
     checkpoints_dir = os.path.join(file_dir, 'checkpoints/translonet')
 
     if is_main_process():
-        for directory in (experiment_dir, file_dir, eval_dir, log_dir, checkpoints_dir):
+        for directory in (experiment_dir, file_dir, eval_dir, log_dir, tensorboard_dir, checkpoints_dir):
             os.makedirs(directory, exist_ok=True)
         for filename in SOURCE_BACKUP_FILES:
             shutil.copy2(os.path.join(base_dir, filename), os.path.join(log_dir, filename))
 
     barrier()
-    return file_dir, eval_dir, log_dir, checkpoints_dir
+    return file_dir, eval_dir, log_dir, tensorboard_dir, checkpoints_dir
 
 
 def make_dataloader(dataset, batch_size, shuffle, sampler=None):
@@ -248,7 +256,7 @@ def append_metric_record(metric_logs, **record):
         handle.write(json.dumps(row) + '\n')
 
 
-def validate_oxford(model, val_loader, epoch, total_epochs, logger, metric_logs=None, lr=''):
+def validate_oxford(model, val_loader, epoch, total_epochs, logger, metric_logs=None, lr='', tb_writer=None):
     total_loss = torch.zeros(1, device=args.device, dtype=torch.float64)
     total_trans_error = torch.zeros(1, device=args.device, dtype=torch.float64)
     total_rot_error = torch.zeros(1, device=args.device, dtype=torch.float64)
@@ -371,6 +379,24 @@ def validate_oxford(model, val_loader, epoch, total_epochs, logger, metric_logs=
         gpu_mem_gb=round(gpu_mem_gb, 3),
         gpu_peak_mem_gb=round(gpu_peak_mem_gb, 3),
     )
+    if is_main_process():
+        log_scalar_group(
+            tb_writer,
+            'val',
+            {
+                'loss': val_loss,
+                'translation_error': val_trans,
+                'rotation_error_deg': val_rot,
+                'epoch_time_sec': val_time_sec,
+                'avg_data_time_sec': avg_data_time_sec,
+                'avg_iter_time_sec': avg_iter_time_sec,
+                'samples_per_sec': samples_per_sec,
+                'avg_points': avg_points,
+                'gpu_mem_gb': gpu_mem_gb,
+                'gpu_peak_mem_gb': gpu_peak_mem_gb,
+            },
+            epoch,
+        )
     return {
         'loss': val_loss,
         'translation_error': val_trans,
@@ -461,288 +487,339 @@ def main():
     global args
 
     setup_runtime()
-    file_dir, eval_dir, log_dir, checkpoints_dir = prepare_output_dirs()
+    file_dir, eval_dir, log_dir, tensorboard_dir, checkpoints_dir = prepare_output_dirs()
     logger = creat_logger(log_dir, args.model_name) if is_main_process() else None
     metric_logs = init_metric_logs(log_dir)
     total_epochs = max(args.max_epoch - 1, 0)
+    tb_writer = SummaryWriter(log_dir=tensorboard_dir) if is_main_process() else None
 
-    if logger is not None:
-        logger.info('----------------------------------------TRAINING----------------------------------')
-        logger.info('PARAMETER ...')
-        logger.info(args)
-        logger.info(
-            'Projection profile: %s (H=%d, W=%d, up=%.2f, down=%.2f)',
-            args.sensor_profile,
-            args.H_input,
-            args.W_input,
-            args.vertical_view_up,
-            args.vertical_view_down,
-        )
-
-    model = translo_model(args, args.batch_size, args.H_input, args.W_input, args.is_training).to(args.device)
-
-    if is_distributed():
-        model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
-        log_message(logger, 'distributed training world_size={}, local_rank={}'.format(args.world_size, args.local_rank))
-    else:
-        log_message(logger, 'single gpu is: {}'.format(args.device.index))
-
-    train_dataset = build_dataset('train', args, is_training=1)
-    train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed() else None
-    train_loader = make_dataloader(train_dataset, args.batch_size, shuffle=True, sampler=train_sampler)
-    log_message(logger, 'Train dataset: %s (%d samples)' % (args.train_dataset_type, len(train_dataset)))
-
-    val_loader = None
-    val_sampler = None
-    excel_eval = None
-    if args.val_dataset_type == 'oxford_qe':
-        val_dataset = build_dataset('val', args, is_training=0)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed() else None
-        val_loader = make_dataloader(val_dataset, args.eval_batch_size, shuffle=False, sampler=val_sampler)
-        if is_main_process():
-            log_message(logger, 'Validation dataset: %s (%d samples)' % (args.val_dataset_type, len(val_dataset)))
-    elif is_main_process():
-        if args.val_dataset_type != 'oxford_qe':
-            excel_eval = SaveExcel(args.kitti_val_seqs, log_dir)
-            log_message(logger, 'Validation dataset: %s (%s)' % (args.val_dataset_type, args.kitti_val_seqs))
-    if is_main_process():
-        log_message(logger, 'KITTI test sequences kept unchanged: {}'.format(args.kitti_test_seqs))
-
-    if args.optimizer == 'SGD':
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
-    elif args.optimizer == 'Adam':
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=args.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-08,
-            weight_decay=args.weight_decay,
-        )
-    else:
-        raise ValueError('Unsupported optimizer {}'.format(args.optimizer))
-
-    optimizer.param_groups[0]['initial_lr'] = args.learning_rate
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=args.lr_stepsize,
-        gamma=args.lr_gamma,
-        last_epoch=-1,
-    )
-
-    if args.ckpt is not None:
-        checkpoint = torch.load(args.ckpt, map_location=args.device)
-        unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['opt_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-        init_epoch = checkpoint['epoch']
-        log_message(logger, 'load model {}'.format(args.ckpt))
-    else:
-        init_epoch = 0
-        log_message(logger, 'Training from scratch')
-
-    barrier()
-
-    if args.eval_before == 1:
-        if val_loader is not None:
-            if is_main_process():
-                log_message(logger, 'Epoch {:03d}: running validation before training'.format(init_epoch))
-            validate_oxford(
-                unwrap_model(model),
-                val_loader,
-                init_epoch,
-                total_epochs,
-                logger,
-                metric_logs=metric_logs,
-                lr='{:.6e}'.format(optimizer.param_groups[0]['lr']),
+    try:
+        if logger is not None:
+            logger.info('----------------------------------------TRAINING----------------------------------')
+            logger.info('PARAMETER ...')
+            logger.info(args)
+            logger.info(
+                'Projection profile: %s (H=%d, W=%d, up=%.2f, down=%.2f)',
+                args.sensor_profile,
+                args.H_input,
+                args.W_input,
+                args.vertical_view_up,
+                args.vertical_view_down,
             )
+
+        model = translo_model(args, args.batch_size, args.H_input, args.W_input, args.is_training).to(args.device)
+
+        if is_distributed():
+            model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
+            log_message(logger, 'distributed training world_size={}, local_rank={}'.format(args.world_size, args.local_rank))
+        else:
+            log_message(logger, 'single gpu is: {}'.format(args.device.index))
+
+        train_dataset = build_dataset('train', args, is_training=1)
+        train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed() else None
+        train_loader = make_dataloader(train_dataset, args.batch_size, shuffle=True, sampler=train_sampler)
+        log_message(logger, 'Train dataset: %s (%d samples)' % (args.train_dataset_type, len(train_dataset)))
+
+        val_loader = None
+        excel_eval = None
+        if args.val_dataset_type == 'oxford_qe':
+            val_dataset = build_dataset('val', args, is_training=0)
+            val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed() else None
+            val_loader = make_dataloader(val_dataset, args.eval_batch_size, shuffle=False, sampler=val_sampler)
+            if is_main_process():
+                log_message(logger, 'Validation dataset: %s (%d samples)' % (args.val_dataset_type, len(val_dataset)))
         elif is_main_process():
-            if val_loader is None:
-                log_message(logger, 'Epoch {:03d}: running KITTI evaluation before training'.format(init_epoch))
-                eval_pose(unwrap_model(model), args.kitti_val_seqs, init_epoch, log_dir, eval_dir, logger)
-                excel_eval.update(eval_dir)
+            if args.val_dataset_type != 'oxford_qe':
+                excel_eval = SaveExcel(args.kitti_val_seqs, log_dir)
+                log_message(logger, 'Validation dataset: %s (%s)' % (args.val_dataset_type, args.kitti_val_seqs))
+        if is_main_process():
+            log_message(logger, 'TensorBoard dir: {}'.format(tensorboard_dir))
+            log_message(logger, 'KITTI test sequences kept unchanged: {}'.format(args.kitti_test_seqs))
+
+        if args.optimizer == 'SGD':
+            optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
+        elif args.optimizer == 'Adam':
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=args.learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-08,
+                weight_decay=args.weight_decay,
+            )
+        else:
+            raise ValueError('Unsupported optimizer {}'.format(args.optimizer))
+
+        optimizer.param_groups[0]['initial_lr'] = args.learning_rate
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.lr_stepsize,
+            gamma=args.lr_gamma,
+            last_epoch=-1,
+        )
+
+        if args.ckpt is not None:
+            checkpoint = torch.load(args.ckpt, map_location=args.device)
+            unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['opt_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+            init_epoch = checkpoint['epoch']
+            log_message(logger, 'load model {}'.format(args.ckpt))
+        else:
+            init_epoch = 0
+            log_message(logger, 'Training from scratch')
+
         barrier()
 
-    for epoch in range(init_epoch + 1, args.max_epoch):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-
-        model.train()
-        if args.device.type == 'cuda':
-            torch.cuda.reset_peak_memory_stats(args.device)
-
-        epoch_loss_sum = 0.0
-        epoch_seen = 0.0
-        epoch_points_sum = 0.0
-        epoch_data_time_sum = 0.0
-        epoch_iter_time_sum = 0.0
-        epoch_steps = 0.0
-        epoch_start = time.time()
-        previous_step_end = epoch_start
-        progress = tqdm(
-            train_loader,
-            total=len(train_loader),
-            smoothing=0.1,
-            desc='Epoch {:03d}/{:03d}'.format(epoch, total_epochs),
-            dynamic_ncols=True,
-            leave=False,
-            disable=not is_main_process(),
-        )
-
-        for step, data in enumerate(progress, 1):
-            iter_start = time.time()
-            data_time = iter_start - previous_step_end
-            pos2, pos1, sample_id, T_gt, T_trans, T_trans_inv, Tr = move_batch_to_device(data)
-            optimizer.zero_grad()
-
-            l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, pc1_output, q_gt, t_gt, w_x, w_q = model(
-                pos2, pos1, T_gt, T_trans, T_trans_inv
-            )
-            loss = get_loss(l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, q_gt, t_gt, w_x, w_q)
-            loss.backward()
-            optimizer.step()
-
-            current_batch_size = len(pos2)
-            batch_points = mean_points_in_batch(pos2)
-            loss_value = float(loss.detach().item())
-            iter_end = time.time()
-            iter_time = iter_end - iter_start
-
-            epoch_loss_sum += loss_value * current_batch_size
-            epoch_seen += current_batch_size
-            epoch_points_sum += batch_points * current_batch_size
-            epoch_data_time_sum += data_time
-            epoch_iter_time_sum += iter_time
-            epoch_steps += 1
-
-            if is_main_process() and (step % PROGRESS_UPDATE_INTERVAL == 0 or step == len(train_loader)):
-                avg_loss = epoch_loss_sum / max(epoch_seen, 1.0)
-                current_mem_gb, peak_mem_gb = safe_gpu_memory_stats(args.device)
-                progress.set_postfix(
-                    loss='{:.4f}'.format(loss_value),
-                    avg='{:.4f}'.format(avg_loss),
-                    lr='{:.2e}'.format(optimizer.param_groups[0]['lr']),
-                    data='{:.2f}s'.format(data_time),
-                    iter='{:.2f}s'.format(iter_time),
-                    ips='{:.1f}'.format((current_batch_size * args.world_size) / max(iter_time, 1e-6)),
-                    pts='{:.1f}k'.format(batch_points / 1000.0),
-                    mem='{:.2f}/{:.2f}G'.format(current_mem_gb, peak_mem_gb),
-                )
-            previous_step_end = iter_end
-
-        scheduler.step()
-        lr = max(optimizer.param_groups[0]['lr'], args.learning_rate_clip)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-
-        current_mem_gb, peak_mem_gb = safe_gpu_memory_stats(args.device)
-        reduced_sums = reduce_tensor(
-            torch.tensor(
-                [
-                    epoch_loss_sum,
-                    epoch_seen,
-                    epoch_points_sum,
-                    epoch_data_time_sum,
-                    epoch_iter_time_sum,
-                    epoch_steps,
-                ],
-                device=args.device,
-                dtype=torch.float64,
-            )
-        )
-        reduced_max = reduce_tensor(
-            torch.tensor(
-                [
-                    time.time() - epoch_start,
-                    current_mem_gb,
-                    peak_mem_gb,
-                ],
-                device=args.device,
-                dtype=torch.float64,
-            ),
-            op=dist.ReduceOp.MAX,
-        )
-
-        train_loss = float(reduced_sums[0].item() / max(reduced_sums[1].item(), 1.0))
-        avg_points = float(reduced_sums[2].item() / max(reduced_sums[1].item(), 1.0))
-        avg_data_time_sec = float(reduced_sums[3].item() / max(reduced_sums[5].item(), 1.0))
-        avg_iter_time_sec = float(reduced_sums[4].item() / max(reduced_sums[5].item(), 1.0))
-        global_samples = int(reduced_sums[1].item())
-        epoch_time_sec = float(reduced_max[0].item())
-        gpu_mem_gb = float(reduced_max[1].item())
-        gpu_peak_mem_gb = float(reduced_max[2].item())
-        samples_per_sec = global_samples / max(epoch_time_sec, 1e-6)
-
-        log_message(
-            logger,
-            'EPOCH {:03d}/{:03d} train loss: {:.6f} | lr: {:.6e} | time: {} | data: {:.2f}s | '
-            'iter: {:.2f}s | ips: {:.2f} | pts: {:.1f}k | mem: {:.2f}/{:.2f}G'.format(
-                epoch,
-                total_epochs,
-                train_loss,
-                lr,
-                format_duration(epoch_time_sec),
-                avg_data_time_sec,
-                avg_iter_time_sec,
-                samples_per_sec,
-                avg_points / 1000.0,
-                gpu_mem_gb,
-                gpu_peak_mem_gb,
-            ),
-        )
-        append_metric_record(
-            metric_logs,
-            timestamp=datetime.datetime.now().isoformat(timespec='seconds'),
-            phase='train',
-            epoch=epoch,
-            total_epochs=total_epochs,
-            loss=round(train_loss, 6),
-            lr='{:.6e}'.format(lr),
-            epoch_time_sec=round(epoch_time_sec, 3),
-            avg_data_time_sec=round(avg_data_time_sec, 4),
-            avg_iter_time_sec=round(avg_iter_time_sec, 4),
-            samples_per_sec=round(samples_per_sec, 3),
-            global_samples=global_samples,
-            avg_points=round(avg_points, 1),
-            gpu_mem_gb=round(gpu_mem_gb, 3),
-            gpu_peak_mem_gb=round(gpu_peak_mem_gb, 3),
-        )
-
-        if epoch % 5 == 0:
-            barrier()
-            if is_main_process():
-                model_name = unwrap_model(model).__class__.__name__
-                save_path = os.path.join(
-                    checkpoints_dir,
-                    '{}_{:03d}_{:04f}.pth.tar'.format(model_name, epoch, train_loss),
-                )
-                torch.save(
-                    {
-                        'model_state_dict': unwrap_model(model).state_dict(),
-                        'opt_state_dict': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'epoch': epoch,
-                    },
-                    save_path,
-                )
-                log_message(logger, 'Epoch {:03d}: saved checkpoint {}'.format(epoch, os.path.basename(save_path)))
-
-                if val_loader is not None:
-                    log_message(logger, 'Epoch {:03d}: starting Oxford validation'.format(epoch))
-                else:
-                    log_message(logger, 'Epoch {:03d}: starting KITTI evaluation'.format(epoch))
-                    eval_pose(unwrap_model(model), args.kitti_val_seqs, epoch, log_dir, eval_dir, logger)
-                    excel_eval.update(eval_dir)
+        if args.eval_before == 1:
             if val_loader is not None:
+                if is_main_process():
+                    log_message(logger, 'Epoch {:03d}: running validation before training'.format(init_epoch))
                 validate_oxford(
                     unwrap_model(model),
                     val_loader,
-                    epoch,
+                    init_epoch,
                     total_epochs,
                     logger,
                     metric_logs=metric_logs,
-                    lr='{:.6e}'.format(lr),
+                    lr='{:.6e}'.format(optimizer.param_groups[0]['lr']),
+                    tb_writer=tb_writer,
                 )
+            elif is_main_process():
+                if val_loader is None:
+                    log_message(logger, 'Epoch {:03d}: running KITTI evaluation before training'.format(init_epoch))
+                    eval_pose(unwrap_model(model), args.kitti_val_seqs, init_epoch, log_dir, eval_dir, logger)
+                    excel_eval.update(eval_dir)
             barrier()
+
+        for epoch in range(init_epoch + 1, args.max_epoch):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
+            model.train()
+            if args.device.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats(args.device)
+
+            epoch_loss_sum = 0.0
+            epoch_seen = 0.0
+            epoch_points_sum = 0.0
+            epoch_data_time_sum = 0.0
+            epoch_iter_time_sum = 0.0
+            epoch_steps = 0.0
+            epoch_start = time.time()
+            previous_step_end = epoch_start
+            progress = tqdm(
+                train_loader,
+                total=len(train_loader),
+                smoothing=0.1,
+                desc='Epoch {:03d}/{:03d}'.format(epoch, total_epochs),
+                dynamic_ncols=True,
+                leave=False,
+                disable=not is_main_process(),
+            )
+
+            for step, data in enumerate(progress, 1):
+                iter_start = time.time()
+                data_time = iter_start - previous_step_end
+                pos2, pos1, sample_id, T_gt, T_trans, T_trans_inv, Tr = move_batch_to_device(data)
+                optimizer.zero_grad()
+
+                l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, pc1_output, q_gt, t_gt, w_x, w_q = model(
+                    pos2, pos1, T_gt, T_trans, T_trans_inv
+                )
+                loss = get_loss(l0_q, l0_t, l1_q, l1_t, l2_q, l2_t, l3_q, l3_t, q_gt, t_gt, w_x, w_q)
+                loss.backward()
+                optimizer.step()
+
+                current_batch_size = len(pos2)
+                batch_points = mean_points_in_batch(pos2)
+                loss_value = float(loss.detach().item())
+                iter_end = time.time()
+                iter_time = iter_end - iter_start
+
+                epoch_loss_sum += loss_value * current_batch_size
+                epoch_seen += current_batch_size
+                epoch_points_sum += batch_points * current_batch_size
+                epoch_data_time_sum += data_time
+                epoch_iter_time_sum += iter_time
+                epoch_steps += 1
+
+                if step % PROGRESS_UPDATE_INTERVAL == 0 or step == len(train_loader):
+                    step_metrics = reduce_tensor(
+                        torch.tensor(
+                            [
+                                loss_value * current_batch_size,
+                                current_batch_size,
+                            ],
+                            device=args.device,
+                            dtype=torch.float64,
+                        )
+                    )
+                    global_step_loss = float(step_metrics[0].item() / max(step_metrics[1].item(), 1.0))
+                    if is_main_process():
+                        avg_loss = epoch_loss_sum / max(epoch_seen, 1.0)
+                        current_mem_gb, peak_mem_gb = safe_gpu_memory_stats(args.device)
+                        progress.set_postfix(
+                            loss='{:.4f}'.format(loss_value),
+                            avg='{:.4f}'.format(avg_loss),
+                            lr='{:.2e}'.format(optimizer.param_groups[0]['lr']),
+                            data='{:.2f}s'.format(data_time),
+                            iter='{:.2f}s'.format(iter_time),
+                            ips='{:.1f}'.format((current_batch_size * args.world_size) / max(iter_time, 1e-6)),
+                            pts='{:.1f}k'.format(batch_points / 1000.0),
+                            mem='{:.2f}/{:.2f}G'.format(current_mem_gb, peak_mem_gb),
+                        )
+                        log_scalar_group(
+                            tb_writer,
+                            'train',
+                            {
+                                'step_loss': global_step_loss,
+                                'lr': optimizer.param_groups[0]['lr'],
+                            },
+                            train_global_step(epoch, step, len(train_loader)),
+                        )
+                previous_step_end = iter_end
+
+            scheduler.step()
+            lr = max(optimizer.param_groups[0]['lr'], args.learning_rate_clip)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+
+            current_mem_gb, peak_mem_gb = safe_gpu_memory_stats(args.device)
+            reduced_sums = reduce_tensor(
+                torch.tensor(
+                    [
+                        epoch_loss_sum,
+                        epoch_seen,
+                        epoch_points_sum,
+                        epoch_data_time_sum,
+                        epoch_iter_time_sum,
+                        epoch_steps,
+                    ],
+                    device=args.device,
+                    dtype=torch.float64,
+                )
+            )
+            reduced_max = reduce_tensor(
+                torch.tensor(
+                    [
+                        time.time() - epoch_start,
+                        current_mem_gb,
+                        peak_mem_gb,
+                    ],
+                    device=args.device,
+                    dtype=torch.float64,
+                ),
+                op=dist.ReduceOp.MAX,
+            )
+
+            train_loss = float(reduced_sums[0].item() / max(reduced_sums[1].item(), 1.0))
+            avg_points = float(reduced_sums[2].item() / max(reduced_sums[1].item(), 1.0))
+            avg_data_time_sec = float(reduced_sums[3].item() / max(reduced_sums[5].item(), 1.0))
+            avg_iter_time_sec = float(reduced_sums[4].item() / max(reduced_sums[5].item(), 1.0))
+            global_samples = int(reduced_sums[1].item())
+            epoch_time_sec = float(reduced_max[0].item())
+            gpu_mem_gb = float(reduced_max[1].item())
+            gpu_peak_mem_gb = float(reduced_max[2].item())
+            samples_per_sec = global_samples / max(epoch_time_sec, 1e-6)
+
+            log_message(
+                logger,
+                'EPOCH {:03d}/{:03d} train loss: {:.6f} | lr: {:.6e} | time: {} | data: {:.2f}s | '
+                'iter: {:.2f}s | ips: {:.2f} | pts: {:.1f}k | mem: {:.2f}/{:.2f}G'.format(
+                    epoch,
+                    total_epochs,
+                    train_loss,
+                    lr,
+                    format_duration(epoch_time_sec),
+                    avg_data_time_sec,
+                    avg_iter_time_sec,
+                    samples_per_sec,
+                    avg_points / 1000.0,
+                    gpu_mem_gb,
+                    gpu_peak_mem_gb,
+                ),
+            )
+            append_metric_record(
+                metric_logs,
+                timestamp=datetime.datetime.now().isoformat(timespec='seconds'),
+                phase='train',
+                epoch=epoch,
+                total_epochs=total_epochs,
+                loss=round(train_loss, 6),
+                lr='{:.6e}'.format(lr),
+                epoch_time_sec=round(epoch_time_sec, 3),
+                avg_data_time_sec=round(avg_data_time_sec, 4),
+                avg_iter_time_sec=round(avg_iter_time_sec, 4),
+                samples_per_sec=round(samples_per_sec, 3),
+                global_samples=global_samples,
+                avg_points=round(avg_points, 1),
+                gpu_mem_gb=round(gpu_mem_gb, 3),
+                gpu_peak_mem_gb=round(gpu_peak_mem_gb, 3),
+            )
+            if is_main_process():
+                w_x_value = float(unwrap_model(model).w_x.detach().item())
+                w_q_value = float(unwrap_model(model).w_q.detach().item())
+                log_scalar_group(
+                    tb_writer,
+                    'train',
+                    {
+                        'epoch_loss': train_loss,
+                        'epoch_time_sec': epoch_time_sec,
+                        'avg_data_time_sec': avg_data_time_sec,
+                        'avg_iter_time_sec': avg_iter_time_sec,
+                        'samples_per_sec': samples_per_sec,
+                        'avg_points': avg_points,
+                        'gpu_mem_gb': gpu_mem_gb,
+                        'gpu_peak_mem_gb': gpu_peak_mem_gb,
+                        'w_x': w_x_value,
+                        'w_q': w_q_value,
+                    },
+                    epoch,
+                )
+
+            if epoch % 5 == 0:
+                barrier()
+                if is_main_process():
+                    model_name = unwrap_model(model).__class__.__name__
+                    save_path = os.path.join(
+                        checkpoints_dir,
+                        '{}_{:03d}_{:04f}.pth.tar'.format(model_name, epoch, train_loss),
+                    )
+                    torch.save(
+                        {
+                            'model_state_dict': unwrap_model(model).state_dict(),
+                            'opt_state_dict': optimizer.state_dict(),
+                            'scheduler': scheduler.state_dict(),
+                            'epoch': epoch,
+                        },
+                        save_path,
+                    )
+                    log_message(logger, 'Epoch {:03d}: saved checkpoint {}'.format(epoch, os.path.basename(save_path)))
+                    if should_log_histograms(epoch):
+                        log_model_histograms(tb_writer, unwrap_model(model).named_parameters(), epoch)
+
+                    if val_loader is not None:
+                        log_message(logger, 'Epoch {:03d}: starting Oxford validation'.format(epoch))
+                    else:
+                        log_message(logger, 'Epoch {:03d}: starting KITTI evaluation'.format(epoch))
+                        eval_pose(unwrap_model(model), args.kitti_val_seqs, epoch, log_dir, eval_dir, logger)
+                        excel_eval.update(eval_dir)
+                if val_loader is not None:
+                    validate_oxford(
+                        unwrap_model(model),
+                        val_loader,
+                        epoch,
+                        total_epochs,
+                        logger,
+                        metric_logs=metric_logs,
+                        lr='{:.6e}'.format(lr),
+                        tb_writer=tb_writer,
+                    )
+                barrier()
+    finally:
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
 
 
 if __name__ == '__main__':

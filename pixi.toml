@@ -22,6 +22,7 @@ pytest = "8.*"
 
 [pypi-dependencies]
 h5py = "==3.11.0"
+tensorboard = "==2.13.0"
 
 [tasks.build-pointnet2]
 cmd = "python setup.py install"
@@ -40,3 +41,6 @@ depends-on = ["build-pointnet2", "build-fused-random", "build-fused-select"]
 
 [tasks.smoke-test]
 cmd = "python -c \"import torch; import pointnet2_cuda; import fused_conv_random_k_cuda; import fused_conv_select_k_cuda; print(torch.__version__)\""
+
+[tasks.tensorboard]
+cmd = "tensorboard --logdir experiment --port 6006"
