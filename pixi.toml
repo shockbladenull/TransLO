@@ -44,4 +44,4 @@ depends-on = ["build-pointnet2", "build-fused-random", "build-fused-select"]
 cmd = "python -c \"import torch; import pointnet2_cuda; import fused_conv_random_k_cuda; import fused_conv_select_k_cuda; print(torch.__version__)\""
 
 [tasks.tensorboard]
-cmd = "tensorboard --logdir experiment --port 0"
+cmd = "tensorboard"

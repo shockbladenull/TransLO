@@ -61,7 +61,7 @@ Training also writes TensorBoard event files under `experiment/<run>/tensorboard
 
 Start TensorBoard with:
 ```bash
-pixi run tensorboard
+pixi run tensorboard --logdir experiment --port 6006
 ```
 
 Then open `http://localhost:6006`.
@@ -93,4 +93,3 @@ We thank the following open-source project for the help of the implementations:
 - [PointNet++](https://github.com/charlesq34/pointnet2) 
 - [KITTI_odometry_evaluation_tool](https://github.com/LeoQLi/KITTI_odometry_evaluation_tool) 
 - [PWCLONet] (https://github.com/IRMVLab/PWCLONet)
-
