@@ -32,3 +32,6 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Local agent notes
+AGENTS.md
