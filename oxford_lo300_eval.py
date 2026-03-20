@@ -122,7 +122,10 @@ def safe_gpu_memory_stats(device):
 def load_checkpoint_model(args, checkpoint_path=None):
     checkpoint_path = checkpoint_path or args.ckpt
     model = translo_model(args, args.eval_batch_size, args.H_input, args.W_input, False).to(args.device)
-    checkpoint = torch.load(checkpoint_path, map_location=args.device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=args.device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     normalized_state_dict = {}
     for key, value in state_dict.items():
