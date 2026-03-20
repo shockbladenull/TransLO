@@ -33,15 +33,33 @@ DEFAULT_OXFORD_FULL_H5 = "velodyne_left_calibrateFalse.h5"
 DEFAULT_OXFORD_POSE_TEMPLATE = "Oxford_SLAM_result_{sequence_short}/gicp_Oxford{sequence_short}_050_v1.txt"
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description="Evaluate a TransLO checkpoint on Oxford LO300 contiguous subsegments")
-    add_translonet_args(parser)
-    parser.add_argument("--output_dir", required=True, help="Directory for Oxford LO300 evaluation outputs")
+def add_oxford_lo300_eval_args(parser, require_output_dir=True):
+    parser.add_argument(
+        "--output_dir",
+        required=require_output_dir,
+        default=None,
+        help="Directory for Oxford LO300 evaluation outputs",
+    )
     parser.add_argument("--oxford_eval_seq", default=DEFAULT_OXFORD_EVAL_SEQ, help="Oxford route to evaluate")
     parser.add_argument(
         "--oxford_eval_mask_name",
         default=DEFAULT_OXFORD_LO_MASK,
         help="Oxford mask H5 used to define LO test frames",
+    )
+    parser.add_argument(
+        "--skip_plots",
+        action="store_true",
+        help="Skip per-segment trajectory/XYZ/RPY/path plots",
+    )
+    parser.add_argument(
+        "--skip_segment_artifacts",
+        action="store_true",
+        help="Skip per-segment trajectory .npy files and metrics.json outputs",
+    )
+    parser.add_argument(
+        "--summary_only",
+        action="store_true",
+        help="Only write summary.json; skip segment tables, plots, and per-segment artifacts",
     )
     parser.set_defaults(
         train_dataset_type="oxford_qe",
@@ -57,15 +75,20 @@ def build_parser():
     return parser
 
 
-def validate_args(parser, args):
-    required_paths = (
-        "ckpt",
-        "oxford_root",
-        "oxford_h5_root",
-        "oxford_full_h5_root",
-        "oxford_pose_root",
-        "output_dir",
-    )
+def build_parser():
+    parser = argparse.ArgumentParser(description="Evaluate a TransLO checkpoint on Oxford LO300 contiguous subsegments")
+    add_translonet_args(parser)
+    add_oxford_lo300_eval_args(parser, require_output_dir=True)
+    return parser
+
+
+def validate_args(parser, args, require_ckpt=True, require_output_dir=True):
+    required_paths = ["oxford_root", "oxford_h5_root", "oxford_full_h5_root", "oxford_pose_root"]
+    if require_ckpt:
+        required_paths.append("ckpt")
+    if require_output_dir:
+        required_paths.append("output_dir")
+
     missing = [name for name in required_paths if not getattr(args, name)]
     if missing:
         parser.error("Missing required arguments: {}".format(", ".join("--{}".format(name) for name in missing)))
@@ -87,9 +110,19 @@ def setup_device(args):
     return torch.device("cpu")
 
 
-def load_checkpoint_model(args):
+def safe_gpu_memory_stats(device):
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 0.0, 0.0
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    current_mem = torch.cuda.memory_allocated(device_index) / (1024 ** 3)
+    peak_mem = torch.cuda.max_memory_allocated(device_index) / (1024 ** 3)
+    return float(current_mem), float(peak_mem)
+
+
+def load_checkpoint_model(args, checkpoint_path=None):
+    checkpoint_path = checkpoint_path or args.ckpt
     model = translo_model(args, args.eval_batch_size, args.H_input, args.W_input, False).to(args.device)
-    checkpoint = torch.load(args.ckpt, map_location=args.device)
+    checkpoint = torch.load(checkpoint_path, map_location=args.device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     normalized_state_dict = {}
     for key, value in state_dict.items():
@@ -112,7 +145,7 @@ def move_batch_to_device(device, batch):
     return pos2, pos1, sample_id, T_gt, T_trans, T_trans_inv, Tr
 
 
-def evaluate_segment(model, device, segment, args):
+def evaluate_segment(model, device, segment, args, show_progress=True):
     dataset = OxfordSegmentPairDataset(
         scan_dir=segment.scan_dir,
         timestamps=segment.timestamps,
@@ -141,6 +174,7 @@ def evaluate_segment(model, device, segment, args):
             desc="segment {:02d}".format(segment.segment_index),
             dynamic_ncols=True,
             leave=False,
+            disable=not show_progress,
         ):
             pos2, pos1, _, T_gt, T_trans, T_trans_inv, _ = move_batch_to_device(device, batch)
             start_time = time.time()
@@ -177,38 +211,7 @@ def evaluate_segment(model, device, segment, args):
     return metrics, pred_trajectory, gt_trajectory
 
 
-def write_json(path, payload):
-    with open(path, "w") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-
-def write_segments_csv(path, rows):
-    if not rows:
-        raise ValueError("Cannot write an empty segments.csv")
-    fieldnames = list(rows[0].keys())
-    with open(path, "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def write_segments_jsonl(path, payloads):
-    with open(path, "w") as handle:
-        for payload in payloads:
-            handle.write(json.dumps(payload, sort_keys=True))
-            handle.write("\n")
-
-
-def main():
-    parser = build_parser()
-    args = finalize_translonet_args(parser.parse_args())
-    validate_args(parser, args)
-    args.device = setup_device(args)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    model, checkpoint = load_checkpoint_model(args)
+def load_segments_from_args(args):
     sequence_data = load_oxford_txt_masked_sequence(
         root_dir=args.oxford_root,
         sequence_name=args.oxford_eval_seq,
@@ -234,36 +237,25 @@ def main():
     ]
     if not segments:
         raise RuntimeError("No Oxford LO segments with at least two frames were found")
+    return sequence_data, segments
 
-    segment_metrics = []
-    segment_rows = []
-    summary_start = time.time()
-    for segment in tqdm(segments, desc="Oxford LO300 segments", dynamic_ncols=True):
-        metrics, pred_trajectory, gt_trajectory = evaluate_segment(model, args.device, segment, args)
-        segment_name = "segment_{:02d}".format(segment.segment_index)
-        segment_dir = os.path.join(args.output_dir, segment_name)
-        os.makedirs(segment_dir, exist_ok=True)
 
-        pred_path = os.path.join(segment_dir, "pred_traj.npy")
-        gt_path = os.path.join(segment_dir, "gt_traj.npy")
-        np.save(pred_path, pose_array_to_rows(pred_trajectory))
-        np.save(gt_path, pose_array_to_rows(gt_trajectory))
-        save_segment_plots(segment_name, gt_trajectory, pred_trajectory, segment_dir)
-
-        metrics["artifacts"] = {
-            "pred_traj_npy": os.path.basename(pred_path),
-            "gt_traj_npy": os.path.basename(gt_path),
-            "plot_prefix": segment_name,
-        }
-        write_json(os.path.join(segment_dir, "metrics.json"), metrics)
-        segment_metrics.append(metrics)
-        segment_rows.append(segment_metrics_to_row(metrics))
-
+def build_summary(
+    args,
+    checkpoint,
+    checkpoint_path,
+    sequence_data,
+    segment_metrics,
+    elapsed_sec,
+    output_dir=None,
+    gpu_mem_gb=0.0,
+    gpu_peak_mem_gb=0.0,
+):
     aggregates = aggregate_segment_metrics(segment_metrics)
     summary = {
         "sequence_name": args.oxford_eval_seq,
         "mask_h5_name": args.oxford_eval_mask_name,
-        "checkpoint_path": os.path.abspath(args.ckpt),
+        "checkpoint_path": os.path.abspath(checkpoint_path),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)) if isinstance(checkpoint, dict) else -1,
         "device": str(args.device),
         "segment_count": int(len(segment_metrics)),
@@ -272,16 +264,152 @@ def main():
         "total_pair_count": int(sum(item["pair_count"] for item in segment_metrics)),
         "aligned_frame_count": int(len(sequence_data["aligned_timestamps"])),
         "selected_frame_count": int(len(sequence_data["selected_timestamps"])),
-        "output_dir": os.path.abspath(args.output_dir),
-        "elapsed_sec": float(time.time() - summary_start),
+        "output_dir": os.path.abspath(output_dir) if output_dir is not None else None,
+        "elapsed_sec": float(elapsed_sec),
+        "gpu_mem_gb": float(gpu_mem_gb),
+        "gpu_peak_mem_gb": float(gpu_peak_mem_gb),
         "aggregates": aggregates,
+        "ranking_metrics": {
+            "trajectory_endpoint_translation_error_percent_mean": float(
+                aggregates["trajectory_endpoint"]["translation_error_percent"]["mean"]
+            ),
+            "trajectory_endpoint_rotation_error_deg_per_m_mean": float(
+                aggregates["trajectory_endpoint"]["rotation_error_deg_per_m"]["mean"]
+            ),
+            "pairwise_translation_mean_m": float(aggregates["pairwise"]["translation_mean_m"]["mean"]),
+            "pairwise_rotation_mean_deg": float(aggregates["pairwise"]["rotation_mean_deg"]["mean"]),
+        },
     }
+    return summary
 
-    write_segments_csv(os.path.join(args.output_dir, "segments.csv"), segment_rows)
-    write_segments_jsonl(os.path.join(args.output_dir, "segments.jsonl"), segment_metrics)
-    write_json(os.path.join(args.output_dir, "summary.json"), summary)
 
-    print("Evaluated {} LO segments from {}".format(len(segment_metrics), args.oxford_eval_seq))
+def write_json(path, payload):
+    with open(path, "w") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def write_segments_csv(path, rows):
+    if not rows:
+        raise ValueError("Cannot write an empty segments.csv")
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_segments_jsonl(path, payloads):
+    with open(path, "w") as handle:
+        for payload in payloads:
+            handle.write(json.dumps(payload, sort_keys=True))
+            handle.write("\n")
+
+
+def evaluate_checkpoint(
+    args,
+    checkpoint_path=None,
+    output_dir=None,
+    prepared_segments=None,
+    skip_plots=None,
+    skip_segment_artifacts=None,
+    summary_only=None,
+    show_progress=True,
+):
+    checkpoint_path = checkpoint_path or args.ckpt
+    output_dir = args.output_dir if output_dir is None else output_dir
+    summary_only = args.summary_only if summary_only is None else summary_only
+    skip_plots = args.skip_plots if skip_plots is None else skip_plots
+    skip_segment_artifacts = args.skip_segment_artifacts if skip_segment_artifacts is None else skip_segment_artifacts
+    if summary_only:
+        skip_plots = True
+        skip_segment_artifacts = True
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    if args.device.type == "cuda" and torch.cuda.is_available():
+        device_index = args.device.index if args.device.index is not None else torch.cuda.current_device()
+        torch.cuda.reset_peak_memory_stats(device_index)
+
+    model, checkpoint = load_checkpoint_model(args, checkpoint_path=checkpoint_path)
+    if prepared_segments is None:
+        sequence_data, segments = load_segments_from_args(args)
+    else:
+        sequence_data, segments = prepared_segments
+
+    segment_metrics = []
+    segment_rows = []
+    summary_start = time.time()
+    segment_iterator = tqdm(
+        segments,
+        desc="Oxford LO300 segments",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    for segment in segment_iterator:
+        metrics, pred_trajectory, gt_trajectory = evaluate_segment(
+            model,
+            args.device,
+            segment,
+            args,
+            show_progress=False,
+        )
+        if output_dir is not None and not summary_only:
+            segment_name = "segment_{:02d}".format(segment.segment_index)
+            segment_dir = os.path.join(output_dir, segment_name)
+            if not skip_plots or not skip_segment_artifacts:
+                os.makedirs(segment_dir, exist_ok=True)
+
+            if not skip_segment_artifacts:
+                pred_path = os.path.join(segment_dir, "pred_traj.npy")
+                gt_path = os.path.join(segment_dir, "gt_traj.npy")
+                np.save(pred_path, pose_array_to_rows(pred_trajectory))
+                np.save(gt_path, pose_array_to_rows(gt_trajectory))
+                metrics["artifacts"] = {
+                    "pred_traj_npy": os.path.basename(pred_path),
+                    "gt_traj_npy": os.path.basename(gt_path),
+                    "plot_prefix": segment_name,
+                }
+                write_json(os.path.join(segment_dir, "metrics.json"), metrics)
+
+            if not skip_plots:
+                save_segment_plots(segment_name, gt_trajectory, pred_trajectory, segment_dir)
+
+        segment_metrics.append(metrics)
+        segment_rows.append(segment_metrics_to_row(metrics))
+
+    elapsed_sec = time.time() - summary_start
+    gpu_mem_gb, gpu_peak_mem_gb = safe_gpu_memory_stats(args.device)
+    summary = build_summary(
+        args=args,
+        checkpoint=checkpoint,
+        checkpoint_path=checkpoint_path,
+        sequence_data=sequence_data,
+        segment_metrics=segment_metrics,
+        elapsed_sec=elapsed_sec,
+        output_dir=output_dir,
+        gpu_mem_gb=gpu_mem_gb,
+        gpu_peak_mem_gb=gpu_peak_mem_gb,
+    )
+
+    if output_dir is not None:
+        if not summary_only:
+            write_segments_csv(os.path.join(output_dir, "segments.csv"), segment_rows)
+            write_segments_jsonl(os.path.join(output_dir, "segments.jsonl"), segment_metrics)
+        write_json(os.path.join(output_dir, "summary.json"), summary)
+
+    return summary, segment_metrics, segment_rows
+
+
+def main():
+    parser = build_parser()
+    args = finalize_translonet_args(parser.parse_args())
+    validate_args(parser, args, require_ckpt=True, require_output_dir=True)
+    args.device = setup_device(args)
+
+    summary, _, _ = evaluate_checkpoint(args)
+    print("Evaluated {} LO segments from {}".format(summary["segment_count"], args.oxford_eval_seq))
     print("Summary written to {}".format(os.path.join(args.output_dir, "summary.json")))
 
 

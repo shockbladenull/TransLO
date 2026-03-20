@@ -3,6 +3,12 @@ import math
 import numpy as np
 
 from dataset_factory import split_oxford_selected_sequence_into_segments
+from oxford_lo300_rank_ckpts import (
+    build_worker_assignments,
+    get_nested_metric,
+    parse_gpu_ids,
+    sort_ranking_rows,
+)
 from tools.oxford_eval_tools import (
     OxfordSegment,
     aggregate_segment_metrics,
@@ -164,3 +170,63 @@ def test_aggregate_segment_metrics_keeps_mean_and_rmse():
         summary["trajectory_endpoint"]["translation_error_percent"]["rmse"],
         math.sqrt((5.0 ** 2 + 7.0 ** 2) / 2.0),
     )
+
+
+def test_get_nested_metric_reads_dotted_summary_key():
+    payload = {
+        "aggregates": {
+            "trajectory_endpoint": {
+                "translation_error_percent": {
+                    "mean": 1.25,
+                },
+            },
+        },
+    }
+
+    value = get_nested_metric(payload, "aggregates.trajectory_endpoint.translation_error_percent.mean")
+
+    assert value == 1.25
+
+
+def test_sort_ranking_rows_orders_by_translation_then_rotation():
+    rows = [
+        {
+            "checkpoint_name": "epoch_010",
+            "translation_metric": 1.5,
+            "rotation_metric": 0.20,
+            "checkpoint_epoch": 10,
+        },
+        {
+            "checkpoint_name": "epoch_020",
+            "translation_metric": 1.0,
+            "rotation_metric": 0.30,
+            "checkpoint_epoch": 20,
+        },
+        {
+            "checkpoint_name": "epoch_030",
+            "translation_metric": 1.0,
+            "rotation_metric": 0.10,
+            "checkpoint_epoch": 30,
+        },
+    ]
+
+    sorted_rows = sort_ranking_rows(rows)
+
+    assert [row["checkpoint_name"] for row in sorted_rows] == ["epoch_030", "epoch_020", "epoch_010"]
+
+
+def test_parse_gpu_ids_defaults_to_single_gpu_namespace():
+    class Args:
+        gpu = 3
+        gpu_ids = None
+
+    assert parse_gpu_ids(Args()) == [3]
+
+
+def test_build_worker_assignments_repeats_gpu_ids_per_job_slot():
+    checkpoint_paths = ["a", "b", "c", "d", "e"]
+
+    worker_gpu_ids, assignments = build_worker_assignments(checkpoint_paths, gpu_ids=[0, 2], jobs_per_gpu=2)
+
+    assert worker_gpu_ids == [0, 0, 2, 2]
+    assert assignments == [["a", "e"], ["b"], ["c"], ["d"]]
