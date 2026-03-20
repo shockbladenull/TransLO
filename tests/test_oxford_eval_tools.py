@@ -4,7 +4,9 @@ import numpy as np
 
 from dataset_factory import split_oxford_selected_sequence_into_segments
 from oxford_lo300_rank_ckpts import (
+    build_checkpoint_gpu_pairs,
     build_worker_assignments,
+    format_progress_postfix,
     get_nested_metric,
     parse_gpu_ids,
     sort_ranking_rows,
@@ -230,3 +232,34 @@ def test_build_worker_assignments_repeats_gpu_ids_per_job_slot():
 
     assert worker_gpu_ids == [0, 0, 2, 2]
     assert assignments == [["a", "e"], ["b"], ["c"], ["d"]]
+
+
+def test_build_checkpoint_gpu_pairs_interleaves_worker_slots():
+    checkpoint_paths = ["a", "b", "c", "d", "e"]
+
+    checkpoint_gpu_pairs, worker_gpu_ids = build_checkpoint_gpu_pairs(checkpoint_paths, gpu_ids=[0, 2], jobs_per_gpu=2)
+
+    assert worker_gpu_ids == [0, 0, 2, 2]
+    assert checkpoint_gpu_pairs == [("a", 0), ("b", 0), ("c", 2), ("d", 2), ("e", 0)]
+
+
+def test_format_progress_postfix_includes_last_and_best_rows():
+    last_row = {
+        "checkpoint_name": "translo_model_020_-6.500000",
+        "translation_metric": 1.25,
+        "rotation_metric": 0.15,
+        "worker_gpu": 2,
+    }
+    best_row = {
+        "checkpoint_name": "translo_model_018_-6.700000",
+        "translation_metric": 1.10,
+        "rotation_metric": 0.10,
+    }
+
+    postfix = format_progress_postfix(last_row, best_row)
+
+    assert "last=" in postfix
+    assert "best=" in postfix
+    assert "@g2" in postfix
+    assert "1.2500/0.1500" in postfix
+    assert "1.1000/0.1000" in postfix

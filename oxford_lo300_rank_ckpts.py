@@ -4,6 +4,9 @@ import glob
 import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
+
+from tqdm import tqdm
 
 from configs import add_translonet_args, finalize_translonet_args
 from oxford_lo300_eval import (
@@ -18,6 +21,9 @@ from oxford_lo300_eval import (
 
 DEFAULT_RANK_TRANSLATION_KEY = "aggregates.trajectory_endpoint.translation_error_percent.mean"
 DEFAULT_RANK_ROTATION_KEY = "aggregates.trajectory_endpoint.rotation_error_deg_per_m.mean"
+_WORKER_ARGS = None
+_WORKER_PREPARED_SEGMENTS = None
+_WORKER_GPU_ID = None
 
 
 def build_parser():
@@ -76,6 +82,15 @@ def checkpoint_label(checkpoint_path):
     return stem
 
 
+def ranking_sort_key(row):
+    return (
+        row["translation_metric"],
+        row["rotation_metric"],
+        row["checkpoint_epoch"] if row["checkpoint_epoch"] >= 0 else float("inf"),
+        row["checkpoint_name"],
+    )
+
+
 def build_ranking_row(summary, translation_key, rotation_key):
     checkpoint_path = summary["checkpoint_path"]
     return {
@@ -95,15 +110,13 @@ def build_ranking_row(summary, translation_key, rotation_key):
 
 
 def sort_ranking_rows(rows):
-    return sorted(
-        rows,
-        key=lambda row: (
-            row["translation_metric"],
-            row["rotation_metric"],
-            row["checkpoint_epoch"] if row["checkpoint_epoch"] >= 0 else float("inf"),
-            row["checkpoint_name"],
-        ),
-    )
+    return sorted(rows, key=ranking_sort_key)
+
+
+def best_ranking_row(rows):
+    if not rows:
+        return None
+    return min(rows, key=ranking_sort_key)
 
 
 def write_csv(path, rows):
@@ -122,100 +135,184 @@ def parse_gpu_ids(args):
     return [int(part) for part in str(args.gpu_ids).split(",") if part.strip()]
 
 
-def build_worker_assignments(checkpoint_paths, gpu_ids, jobs_per_gpu):
+def build_worker_gpu_ids(gpu_ids, jobs_per_gpu):
     if jobs_per_gpu < 1:
         raise ValueError("jobs_per_gpu must be >= 1")
     worker_gpu_ids = []
     for gpu_id in gpu_ids:
         for _ in range(jobs_per_gpu):
             worker_gpu_ids.append(int(gpu_id))
+    return worker_gpu_ids
+
+
+def build_worker_assignments(checkpoint_paths, gpu_ids, jobs_per_gpu):
+    worker_gpu_ids = build_worker_gpu_ids(gpu_ids, jobs_per_gpu)
     assignments = [[] for _ in worker_gpu_ids]
     for index, checkpoint_path in enumerate(checkpoint_paths):
         assignments[index % len(worker_gpu_ids)].append(checkpoint_path)
     return worker_gpu_ids, assignments
 
 
-def _evaluate_checkpoint_subset(
+def build_checkpoint_gpu_pairs(checkpoint_paths, gpu_ids, jobs_per_gpu):
+    worker_gpu_ids, assignments = build_worker_assignments(checkpoint_paths, gpu_ids, jobs_per_gpu)
+    checkpoint_gpu_pairs = []
+    max_assignment_length = max((len(assignment) for assignment in assignments), default=0)
+    for assignment_index in range(max_assignment_length):
+        for slot_index, gpu_id in enumerate(worker_gpu_ids):
+            assignment = assignments[slot_index]
+            if assignment_index < len(assignment):
+                checkpoint_gpu_pairs.append((assignment[assignment_index], int(gpu_id)))
+    return checkpoint_gpu_pairs, worker_gpu_ids
+
+
+def shorten_checkpoint_name(checkpoint_name, max_len=24):
+    checkpoint_name = str(checkpoint_name)
+    if len(checkpoint_name) <= max_len:
+        return checkpoint_name
+    return "...{}".format(checkpoint_name[-(max_len - 3):])
+
+
+def format_progress_postfix(last_row, best_row):
+    parts = []
+    if last_row is not None:
+        parts.append(
+            "last={}@g{} {:.4f}/{:.4f}".format(
+                shorten_checkpoint_name(last_row["checkpoint_name"]),
+                last_row.get("worker_gpu", "?"),
+                float(last_row["translation_metric"]),
+                float(last_row["rotation_metric"]),
+            )
+        )
+    if best_row is not None:
+        parts.append(
+            "best={} {:.4f}/{:.4f}".format(
+                shorten_checkpoint_name(best_row["checkpoint_name"]),
+                float(best_row["translation_metric"]),
+                float(best_row["rotation_metric"]),
+            )
+        )
+    return " | ".join(parts)
+
+
+def _get_worker_context(args_dict, gpu_id):
+    global _WORKER_ARGS, _WORKER_PREPARED_SEGMENTS, _WORKER_GPU_ID
+
+    gpu_id = int(gpu_id)
+    if _WORKER_ARGS is None or _WORKER_PREPARED_SEGMENTS is None or _WORKER_GPU_ID != gpu_id:
+        import argparse as _argparse
+
+        args = _argparse.Namespace(**args_dict)
+        args.gpu = gpu_id
+        args.device = setup_device(args)
+        prepared_segments = load_segments_from_args(args)
+        _WORKER_ARGS = args
+        _WORKER_PREPARED_SEGMENTS = prepared_segments
+        _WORKER_GPU_ID = gpu_id
+    return _WORKER_ARGS, _WORKER_PREPARED_SEGMENTS
+
+
+def _evaluate_single_checkpoint(
     args_dict,
-    checkpoint_paths,
+    checkpoint_path,
     gpu_id,
     save_per_ckpt_summary,
     output_dir,
     translation_key,
     rotation_key,
 ):
-    import argparse as _argparse
+    args, prepared_segments = _get_worker_context(args_dict, gpu_id)
 
-    if not checkpoint_paths:
-        return []
-
-    args = _argparse.Namespace(**args_dict)
-    args.gpu = int(gpu_id)
-    args.device = setup_device(args)
-    prepared_segments = load_segments_from_args(args)
-
-    results = []
-    for checkpoint_path in checkpoint_paths:
-        checkpoint_output_dir = None
-        if save_per_ckpt_summary:
-            checkpoint_output_dir = os.path.join(output_dir, "checkpoints", checkpoint_label(checkpoint_path))
-        summary, _, _ = evaluate_checkpoint(
-            args,
-            checkpoint_path=checkpoint_path,
-            output_dir=checkpoint_output_dir,
-            prepared_segments=prepared_segments,
-            summary_only=True,
-            skip_plots=True,
-            skip_segment_artifacts=True,
-            show_progress=False,
-        )
-        summary["worker_gpu"] = int(gpu_id)
-        results.append(build_ranking_row(summary, translation_key, rotation_key))
-    return results
+    checkpoint_output_dir = None
+    if save_per_ckpt_summary:
+        checkpoint_output_dir = os.path.join(output_dir, "checkpoints", checkpoint_label(checkpoint_path))
+    summary, _, _ = evaluate_checkpoint(
+        args,
+        checkpoint_path=checkpoint_path,
+        output_dir=checkpoint_output_dir,
+        prepared_segments=prepared_segments,
+        summary_only=True,
+        skip_plots=True,
+        skip_segment_artifacts=True,
+        show_progress=False,
+    )
+    summary["worker_gpu"] = int(gpu_id)
+    return build_ranking_row(summary, translation_key, rotation_key)
 
 
-def evaluate_rankings_parallel(args, checkpoint_paths):
+def evaluate_rankings_parallel(args, checkpoint_paths, show_progress=True):
     gpu_ids = parse_gpu_ids(args)
-    worker_gpu_ids, assignments = build_worker_assignments(checkpoint_paths, gpu_ids, args.jobs_per_gpu)
+    checkpoint_gpu_pairs, worker_gpu_ids = build_checkpoint_gpu_pairs(checkpoint_paths, gpu_ids, args.jobs_per_gpu)
     args_dict = vars(args).copy()
     args_dict.pop("device", None)
 
     ranking_rows = []
-    if len(worker_gpu_ids) == 1:
-        ranking_rows.extend(
-            _evaluate_checkpoint_subset(
-                args_dict,
-                assignments[0],
-                worker_gpu_ids[0],
-                args.save_per_ckpt_summary,
-                args.output_dir,
-                args.rank_translation_key,
-                args.rank_rotation_key,
-            )
-        )
-        return ranking_rows
+    progress_bar = tqdm(
+        total=len(checkpoint_paths),
+        desc="Sweep",
+        unit="ckpt",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
 
-    mp_context = mp.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=len(worker_gpu_ids), mp_context=mp_context) as executor:
-        futures = []
-        for gpu_id, assignment in zip(worker_gpu_ids, assignments):
-            if not assignment:
-                continue
-            futures.append(
-                executor.submit(
-                    _evaluate_checkpoint_subset,
+    def _consume_result(row):
+        ranking_rows.append(row)
+        progress_bar.update(1)
+        progress_bar.set_postfix_str(format_progress_postfix(row, best_ranking_row(ranking_rows)))
+
+    try:
+        if len(worker_gpu_ids) == 1:
+            for checkpoint_path, gpu_id in checkpoint_gpu_pairs:
+                row = _evaluate_single_checkpoint(
                     args_dict,
-                    assignment,
+                    checkpoint_path,
                     gpu_id,
                     args.save_per_ckpt_summary,
                     args.output_dir,
                     args.rank_translation_key,
                     args.rank_rotation_key,
                 )
-            )
-        for future in as_completed(futures):
-            ranking_rows.extend(future.result())
-    return ranking_rows
+                _consume_result(row)
+            return ranking_rows
+
+        mp_context = mp.get_context("spawn")
+        with ExitStack() as stack:
+            executors = {
+                int(gpu_id): stack.enter_context(
+                    ProcessPoolExecutor(max_workers=args.jobs_per_gpu, mp_context=mp_context)
+                )
+                for gpu_id in gpu_ids
+            }
+            futures = {}
+            for checkpoint_path, gpu_id in checkpoint_gpu_pairs:
+                future = executors[int(gpu_id)].submit(
+                    _evaluate_single_checkpoint,
+                    args_dict,
+                    checkpoint_path,
+                    gpu_id,
+                    args.save_per_ckpt_summary,
+                    args.output_dir,
+                    args.rank_translation_key,
+                    args.rank_rotation_key,
+                )
+                futures[future] = {
+                    "checkpoint_path": checkpoint_path,
+                    "gpu_id": int(gpu_id),
+                }
+
+            for future in as_completed(futures):
+                meta = futures[future]
+                try:
+                    row = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Checkpoint evaluation failed for {} on gpu {}".format(
+                            meta["checkpoint_path"], meta["gpu_id"]
+                        )
+                    ) from exc
+                _consume_result(row)
+        return ranking_rows
+    finally:
+        progress_bar.close()
 
 
 def main():
@@ -235,8 +332,18 @@ def main():
     if not checkpoint_paths:
         parser.error("No checkpoints matched --ckpt_glob {}".format(args.ckpt_glob))
 
+    gpu_ids = parse_gpu_ids(args)
+    total_workers = len(gpu_ids) * int(args.jobs_per_gpu)
+    print(
+        "Sweep config: {} checkpoints across GPUs {} with {} parallel workers".format(
+            len(checkpoint_paths),
+            ",".join(str(gpu_id) for gpu_id in gpu_ids),
+            total_workers,
+        )
+    )
+
     os.makedirs(args.output_dir, exist_ok=True)
-    ranking_rows = evaluate_rankings_parallel(args, checkpoint_paths)
+    ranking_rows = evaluate_rankings_parallel(args, checkpoint_paths, show_progress=True)
     ranking_rows = sort_ranking_rows(ranking_rows)
     top_k_rows = ranking_rows[: min(args.top_k, len(ranking_rows))]
     ranking_payload = {
@@ -247,7 +354,7 @@ def main():
         "top_k": int(min(args.top_k, len(ranking_rows))),
         "rank_translation_key": args.rank_translation_key,
         "rank_rotation_key": args.rank_rotation_key,
-        "gpu_ids": parse_gpu_ids(args),
+        "gpu_ids": gpu_ids,
         "jobs_per_gpu": int(args.jobs_per_gpu),
         "ranking": ranking_rows,
         "top_k_ranking": top_k_rows,
