@@ -69,9 +69,7 @@ def _resolve_sensor_profile(args):
     return args
 
 
-def translonet_args():
-
-    parser = argparse.ArgumentParser()
+def add_translonet_args(parser):
     parser.add_argument('--gpu', type=int, default=0, help='GPU to use [default: GPU 3]')
     parser.add_argument('--multi_gpu', type=str, default=None, help='The gpu [default : null]')
     parser.add_argument('--limit_or_filter', type=bool, default=True, help='if False, filter will reserve 40m~50m points')
@@ -174,7 +172,15 @@ def translonet_args():
     #Decoder
     parser.add_argument('--corr_decoder_has_pos_emb', type=bool, default=True, help='if decoder has pos emb')
 
-    args = parser.parse_args()
+    return parser
+
+
+def build_translonet_parser():
+    parser = argparse.ArgumentParser()
+    return add_translonet_args(parser)
+
+
+def finalize_translonet_args(args):
     args.kitti_train_seqs = _normalize_list_arg(args.kitti_train_seqs, int)
     args.kitti_val_seqs = _normalize_list_arg(args.kitti_val_seqs, int)
     args.kitti_test_seqs = _normalize_list_arg(args.kitti_test_seqs, int)
@@ -186,3 +192,10 @@ def translonet_args():
         raise ValueError('--save_eval_interval must be a positive integer')
     args = _resolve_sensor_profile(args)
     return args
+
+
+def translonet_args(argv=None):
+    parser = build_translonet_parser()
+    args = parser.parse_args(argv)
+
+    return finalize_translonet_args(args)

@@ -124,6 +124,149 @@ def _select_masked_txt_poses(mask_timestamps, full_timestamps, aligned_timestamp
     return np.asarray(selected_timestamps, dtype=np.int64), np.asarray(selected_poses, dtype=np.float32)
 
 
+def load_oxford_txt_masked_sequence(
+    root_dir,
+    sequence_name,
+    h5_name="velodyne_left_calibrateFalse.h5",
+    h5_root=None,
+    full_h5_name="velodyne_left_calibrateFalse.h5",
+    full_h5_root=None,
+    pose_root=None,
+    pose_txt_template="Oxford_SLAM_result_{sequence_short}/gicp_Oxford{sequence_short}_050_v1.txt",
+    pose_skip_start=5,
+    pose_skip_end=5,
+    trim_edges=0,
+):
+    if h5py is None:
+        raise ImportError("h5py is required for Oxford TXT pose loading")
+    if root_dir is None:
+        raise ValueError("root_dir must be set when loading Oxford TXT pose data")
+
+    seq_dir = os.path.join(root_dir, sequence_name)
+    scan_dir = os.path.join(seq_dir, "velodyne_left")
+    if not os.path.isdir(scan_dir):
+        raise FileNotFoundError("Oxford scan directory not found: {}".format(scan_dir))
+
+    mask_h5_path = _resolve_oxford_sequence_file(
+        sequence_name=sequence_name,
+        seq_dir=seq_dir,
+        filename=h5_name,
+        root_override=h5_root,
+    )
+    if not os.path.isfile(mask_h5_path):
+        raise FileNotFoundError("Oxford mask H5 not found: {}".format(mask_h5_path))
+
+    full_h5_path = _resolve_oxford_sequence_file(
+        sequence_name=sequence_name,
+        seq_dir=seq_dir,
+        filename=full_h5_name,
+        root_override=full_h5_root,
+    )
+    if not os.path.isfile(full_h5_path):
+        raise FileNotFoundError("Oxford full H5 not found: {}".format(full_h5_path))
+
+    txt_root = pose_root if pose_root is not None else root_dir
+    sequence_short = _oxford_sequence_short_name(sequence_name)
+    relative_path = pose_txt_template.format(sequence=sequence_name, sequence_short=sequence_short)
+    txt_path = os.path.join(txt_root, relative_path)
+    if not os.path.isfile(txt_path):
+        raise FileNotFoundError("Oxford TXT pose file not found: {}".format(txt_path))
+
+    with h5py.File(mask_h5_path, "r") as h5_file:
+        mask_timestamps = np.asarray(h5_file["valid_timestamps"], dtype=np.int64)
+    with h5py.File(full_h5_path, "r") as h5_file:
+        full_timestamps = np.asarray(h5_file["valid_timestamps"], dtype=np.int64)
+
+    txt_poses = np.loadtxt(txt_path, dtype=np.float32)
+    aligned_timestamps, aligned_poses = _align_txt_poses_to_full_timestamps(
+        txt_poses=txt_poses,
+        full_timestamps=full_timestamps,
+        skip_start=pose_skip_start,
+        skip_end=pose_skip_end,
+    )
+    selected_timestamps, selected_poses = _select_masked_txt_poses(
+        mask_timestamps=mask_timestamps,
+        full_timestamps=full_timestamps,
+        aligned_timestamps=aligned_timestamps,
+        aligned_poses=aligned_poses,
+        skip_start=pose_skip_start,
+        skip_end=pose_skip_end,
+    )
+
+    aligned_index_lookup = {
+        int(timestamp): idx for idx, timestamp in enumerate(np.asarray(aligned_timestamps, dtype=np.int64))
+    }
+    selected_aligned_indices = np.asarray(
+        [aligned_index_lookup[int(timestamp)] for timestamp in selected_timestamps],
+        dtype=np.int64,
+    )
+
+    trim_edges = max(int(trim_edges), 0)
+    if trim_edges > 0:
+        if len(selected_timestamps) <= (2 * trim_edges):
+            raise ValueError(
+                "Oxford sequence {} is too short after trimming {} masked frames on each side".format(
+                    sequence_name, trim_edges
+                )
+            )
+        selected_timestamps = selected_timestamps[trim_edges:-trim_edges]
+        selected_poses = selected_poses[trim_edges:-trim_edges]
+        selected_aligned_indices = selected_aligned_indices[trim_edges:-trim_edges]
+
+    return {
+        "sequence_name": sequence_name,
+        "sequence_short": sequence_short,
+        "seq_dir": seq_dir,
+        "scan_dir": scan_dir,
+        "mask_h5_path": mask_h5_path,
+        "full_h5_path": full_h5_path,
+        "txt_path": txt_path,
+        "full_timestamps": full_timestamps,
+        "aligned_timestamps": aligned_timestamps.astype(np.int64),
+        "aligned_poses": aligned_poses.astype(np.float32),
+        "selected_timestamps": np.asarray(selected_timestamps, dtype=np.int64),
+        "selected_poses": np.asarray(selected_poses, dtype=np.float32),
+        "selected_aligned_indices": np.asarray(selected_aligned_indices, dtype=np.int64),
+    }
+
+
+def split_oxford_selected_sequence_into_segments(selected_timestamps, selected_poses, selected_aligned_indices):
+    selected_timestamps = np.asarray(selected_timestamps, dtype=np.int64)
+    selected_poses = np.asarray(selected_poses, dtype=np.float32)
+    selected_aligned_indices = np.asarray(selected_aligned_indices, dtype=np.int64)
+
+    if len(selected_timestamps) != len(selected_poses) or len(selected_timestamps) != len(selected_aligned_indices):
+        raise ValueError("Oxford selected timestamps, poses, and aligned indices must have identical lengths")
+    if len(selected_timestamps) == 0:
+        return []
+
+    segments = []
+    start_idx = 0
+    for end_idx in range(1, len(selected_timestamps) + 1):
+        reached_end = end_idx == len(selected_timestamps)
+        is_break = (
+            not reached_end
+            and selected_aligned_indices[end_idx] != (selected_aligned_indices[end_idx - 1] + 1)
+        )
+        if not reached_end and not is_break:
+            continue
+
+        segment = {
+            "segment_index": len(segments) + 1,
+            "timestamps": selected_timestamps[start_idx:end_idx].copy(),
+            "poses": selected_poses[start_idx:end_idx].copy(),
+            "aligned_indices": selected_aligned_indices[start_idx:end_idx].copy(),
+        }
+        segment["start_timestamp"] = int(segment["timestamps"][0])
+        segment["end_timestamp"] = int(segment["timestamps"][-1])
+        segment["start_aligned_index"] = int(segment["aligned_indices"][0])
+        segment["end_aligned_index"] = int(segment["aligned_indices"][-1])
+        segments.append(segment)
+        start_idx = end_idx
+
+    return segments
+
+
 class OxfordQEDataset(data.Dataset):
     def __init__(
         self,
@@ -214,48 +357,20 @@ class OxfordQEDataset(data.Dataset):
         return timestamps, poses
 
     def _load_txt_sequence(self, seq_dir, sequence_name):
-        mask_h5_path = _resolve_oxford_sequence_file(
+        sequence_data = load_oxford_txt_masked_sequence(
+            root_dir=self.root_dir,
             sequence_name=sequence_name,
-            seq_dir=seq_dir,
-            filename=self.h5_name,
-            root_override=self.h5_root,
+            h5_name=self.h5_name,
+            h5_root=self.h5_root,
+            full_h5_name=self.full_h5_name,
+            full_h5_root=self.full_h5_root,
+            pose_root=self.pose_root,
+            pose_txt_template=self.pose_txt_template,
+            pose_skip_start=self.pose_skip_start,
+            pose_skip_end=self.pose_skip_end,
+            trim_edges=0,
         )
-        if not os.path.isfile(mask_h5_path):
-            raise FileNotFoundError("Oxford mask H5 not found: {}".format(mask_h5_path))
-
-        full_h5_path = _resolve_oxford_sequence_file(
-            sequence_name=sequence_name,
-            seq_dir=seq_dir,
-            filename=self.full_h5_name,
-            root_override=self.full_h5_root,
-        )
-        if not os.path.isfile(full_h5_path):
-            raise FileNotFoundError("Oxford full H5 not found: {}".format(full_h5_path))
-
-        txt_path = self._resolve_pose_txt_path(sequence_name)
-        if not os.path.isfile(txt_path):
-            raise FileNotFoundError("Oxford TXT pose file not found: {}".format(txt_path))
-
-        with h5py.File(mask_h5_path, "r") as h5_file:
-            mask_timestamps = np.asarray(h5_file["valid_timestamps"], dtype=np.int64)
-        with h5py.File(full_h5_path, "r") as h5_file:
-            full_timestamps = np.asarray(h5_file["valid_timestamps"], dtype=np.int64)
-
-        txt_poses = np.loadtxt(txt_path, dtype=np.float32)
-        aligned_timestamps, aligned_poses = _align_txt_poses_to_full_timestamps(
-            txt_poses=txt_poses,
-            full_timestamps=full_timestamps,
-            skip_start=self.pose_skip_start,
-            skip_end=self.pose_skip_end,
-        )
-        return _select_masked_txt_poses(
-            mask_timestamps=mask_timestamps,
-            full_timestamps=full_timestamps,
-            aligned_timestamps=aligned_timestamps,
-            aligned_poses=aligned_poses,
-            skip_start=self.pose_skip_start,
-            skip_end=self.pose_skip_end,
-        )
+        return sequence_data["selected_timestamps"], sequence_data["selected_poses"]
 
     def _resolve_pose_txt_path(self, sequence_name):
         sequence_short = _oxford_sequence_short_name(sequence_name)
