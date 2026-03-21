@@ -20,6 +20,7 @@ from tools.oxford_eval_tools import (
     build_segment,
     build_segment_metrics,
     pose_array_to_rows,
+    save_full_route_plots,
     save_segment_plots,
     segment_metrics_to_row,
 )
@@ -343,6 +344,8 @@ def evaluate_checkpoint(
 
     segment_metrics = []
     segment_rows = []
+    pred_trajectories = []
+    gt_trajectories = []
     summary_start = time.time()
     segment_iterator = tqdm(
         segments,
@@ -381,6 +384,11 @@ def evaluate_checkpoint(
 
         segment_metrics.append(metrics)
         segment_rows.append(segment_metrics_to_row(metrics))
+        pred_trajectories.append(pred_trajectory)
+        gt_trajectories.append(gt_trajectory)
+
+    if output_dir is not None and not summary_only and not skip_plots:
+        save_full_route_plots('full_route', segments, gt_trajectories, pred_trajectories, output_dir)
 
     elapsed_sec = time.time() - summary_start
     gpu_mem_gb, gpu_peak_mem_gb = safe_gpu_memory_stats(args.device)
@@ -395,6 +403,14 @@ def evaluate_checkpoint(
         gpu_mem_gb=gpu_mem_gb,
         gpu_peak_mem_gb=gpu_peak_mem_gb,
     )
+
+    if output_dir is not None and not summary_only and not skip_plots:
+        summary["route_artifacts"] = {
+            "full_route_path_png": "full_route_path.png",
+            "full_route_path_pdf": "full_route_path.pdf",
+            "full_route_path_3D_png": "full_route_path_3D.png",
+            "full_route_path_3D_pdf": "full_route_path_3D.pdf",
+        }
 
     if output_dir is not None:
         if not summary_only:

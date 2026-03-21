@@ -3,6 +3,7 @@ import csv
 import glob
 import multiprocessing as mp
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import ExitStack
 
@@ -18,38 +19,52 @@ from oxford_lo300_eval import (
     write_json,
 )
 
-
-DEFAULT_RANK_TRANSLATION_KEY = "aggregates.trajectory_endpoint.translation_error_percent.mean"
-DEFAULT_RANK_ROTATION_KEY = "aggregates.trajectory_endpoint.rotation_error_deg_per_m.mean"
+DEFAULT_AFTER_EPOCH = 100
+DEFAULT_EPOCH_STRIDE = 5
+EVALUATION_METRIC_FIELDS = (
+    ("pairwise_translation_mean_m", "aggregates.pairwise.translation_mean_m.mean"),
+    ("pairwise_rotation_mean_deg", "aggregates.pairwise.rotation_mean_deg.mean"),
+    ("trajectory_endpoint_translation_error_percent", "aggregates.trajectory_endpoint.translation_error_percent.mean"),
+    ("trajectory_endpoint_rotation_error_deg_per_m", "aggregates.trajectory_endpoint.rotation_error_deg_per_m.mean"),
+    ("trajectory_per_frame_translation_mean_m", "aggregates.trajectory_per_frame.translation_mean_m.mean"),
+    ("trajectory_per_frame_rotation_mean_deg", "aggregates.trajectory_per_frame.rotation_mean_deg.mean"),
+)
 _WORKER_ARGS = None
 _WORKER_PREPARED_SEGMENTS = None
 _WORKER_GPU_ID = None
 
 
+def _suppress_option_help(parser, option_strings):
+    for option_string in option_strings:
+        action = parser._option_string_actions.get(option_string)
+        if action is not None:
+            action.help = argparse.SUPPRESS
+
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(description="Rank multiple TransLO checkpoints on Oxford LO300 metrics")
+    parser = argparse.ArgumentParser(
+        description="Run detailed Oxford LO300 evaluation for periodic TransLO checkpoints"
+    )
     add_translonet_args(parser)
     add_oxford_lo300_eval_args(parser, require_output_dir=True)
+    _suppress_option_help(parser, ['--ckpt', '--skip_plots', '--skip_segment_artifacts', '--summary_only'])
     parser.add_argument(
         "--ckpt_glob",
         required=True,
         help="Glob pattern for checkpoints to evaluate, for example experiment/run/checkpoints/translonet/*.pth.tar",
     )
-    parser.add_argument("--top_k", type=int, default=5, help="Number of top checkpoints to report")
     parser.add_argument(
-        "--rank_translation_key",
-        default=DEFAULT_RANK_TRANSLATION_KEY,
-        help="Dotted summary key used as the primary ranking metric",
+        "--after_epoch",
+        type=int,
+        default=DEFAULT_AFTER_EPOCH,
+        help="Only evaluate checkpoints with epoch strictly greater than this value",
     )
     parser.add_argument(
-        "--rank_rotation_key",
-        default=DEFAULT_RANK_ROTATION_KEY,
-        help="Dotted summary key used as the secondary ranking metric",
-    )
-    parser.add_argument(
-        "--save_per_ckpt_summary",
-        action="store_true",
-        help="Write summary.json for every checkpoint under output_dir/checkpoints/<ckpt_name>/",
+        "--epoch_stride",
+        type=int,
+        default=DEFAULT_EPOCH_STRIDE,
+        help="Evaluate every N epochs after --after_epoch",
     )
     parser.add_argument(
         "--gpu_ids",
@@ -65,6 +80,36 @@ def build_parser():
     return parser
 
 
+def checkpoint_label(checkpoint_path):
+    basename = os.path.basename(checkpoint_path)
+    stem = os.path.splitext(basename)[0]
+    if stem.endswith(".pth"):
+        stem = os.path.splitext(stem)[0]
+    return stem
+
+
+def extract_checkpoint_epoch(checkpoint_path):
+    match = re.search(r"translo_model_(\d+)", os.path.basename(checkpoint_path))
+    if match is None:
+        raise ValueError("Could not parse checkpoint epoch from '{}'".format(checkpoint_path))
+    return int(match.group(1))
+
+
+def should_evaluate_checkpoint(epoch, after_epoch, epoch_stride):
+    if epoch_stride < 1:
+        raise ValueError("epoch_stride must be >= 1")
+    return int(epoch) > int(after_epoch) and ((int(epoch) - int(after_epoch)) % int(epoch_stride) == 0)
+
+
+def select_checkpoint_paths(checkpoint_paths, after_epoch, epoch_stride):
+    selected_paths = []
+    for checkpoint_path in checkpoint_paths:
+        epoch = extract_checkpoint_epoch(checkpoint_path)
+        if should_evaluate_checkpoint(epoch, after_epoch=after_epoch, epoch_stride=epoch_stride):
+            selected_paths.append(checkpoint_path)
+    return selected_paths
+
+
 def get_nested_metric(payload, dotted_key):
     current = payload
     for part in dotted_key.split("."):
@@ -74,54 +119,32 @@ def get_nested_metric(payload, dotted_key):
     return float(current)
 
 
-def checkpoint_label(checkpoint_path):
-    basename = os.path.basename(checkpoint_path)
-    stem = os.path.splitext(basename)[0]
-    if stem.endswith(".pth"):
-        stem = os.path.splitext(stem)[0]
-    return stem
-
-
-def ranking_sort_key(row):
-    return (
-        row["translation_metric"],
-        row["rotation_metric"],
-        row["checkpoint_epoch"] if row["checkpoint_epoch"] >= 0 else float("inf"),
-        row["checkpoint_name"],
-    )
-
-
-def build_ranking_row(summary, translation_key, rotation_key):
+def build_evaluation_row(summary, checkpoint_output_dir):
     checkpoint_path = summary["checkpoint_path"]
-    return {
+    row = {
         "checkpoint_name": checkpoint_label(checkpoint_path),
         "checkpoint_path": checkpoint_path,
         "checkpoint_epoch": int(summary.get("checkpoint_epoch", -1)),
-        "translation_metric_key": translation_key,
-        "translation_metric": get_nested_metric(summary, translation_key),
-        "rotation_metric_key": rotation_key,
-        "rotation_metric": get_nested_metric(summary, rotation_key),
+        "worker_gpu": summary.get("worker_gpu"),
+        "output_dir": os.path.abspath(checkpoint_output_dir),
+        "summary_json": os.path.join(os.path.abspath(checkpoint_output_dir), "summary.json"),
         "segment_count": int(summary["segment_count"]),
         "elapsed_sec": float(summary["elapsed_sec"]),
         "gpu_mem_gb": float(summary.get("gpu_mem_gb", 0.0)),
         "gpu_peak_mem_gb": float(summary.get("gpu_peak_mem_gb", 0.0)),
-        "worker_gpu": summary.get("worker_gpu"),
     }
+    for field_name, summary_key in EVALUATION_METRIC_FIELDS:
+        row[field_name] = get_nested_metric(summary, summary_key)
+    return row
 
 
-def sort_ranking_rows(rows):
-    return sorted(rows, key=ranking_sort_key)
-
-
-def best_ranking_row(rows):
-    if not rows:
-        return None
-    return min(rows, key=ranking_sort_key)
+def sort_evaluation_rows(rows):
+    return sorted(rows, key=lambda row: (row["checkpoint_epoch"], row["checkpoint_name"]))
 
 
 def write_csv(path, rows):
     if not rows:
-        raise ValueError("Cannot write an empty ranking CSV")
+        raise ValueError("Cannot write an empty evaluation CSV")
     fieldnames = list(rows[0].keys())
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -172,26 +195,16 @@ def shorten_checkpoint_name(checkpoint_name, max_len=24):
     return "...{}".format(checkpoint_name[-(max_len - 3):])
 
 
-def format_progress_postfix(last_row, best_row):
-    parts = []
-    if last_row is not None:
-        parts.append(
-            "last={}@g{} {:.4f}/{:.4f}".format(
-                shorten_checkpoint_name(last_row["checkpoint_name"]),
-                last_row.get("worker_gpu", "?"),
-                float(last_row["translation_metric"]),
-                float(last_row["rotation_metric"]),
-            )
-        )
-    if best_row is not None:
-        parts.append(
-            "best={} {:.4f}/{:.4f}".format(
-                shorten_checkpoint_name(best_row["checkpoint_name"]),
-                float(best_row["translation_metric"]),
-                float(best_row["rotation_metric"]),
-            )
-        )
-    return " | ".join(parts)
+def format_progress_postfix(last_row):
+    if last_row is None:
+        return ""
+    return "last={}@g{} epoch={} {:.4f}/{:.4f}".format(
+        shorten_checkpoint_name(last_row["checkpoint_name"]),
+        last_row.get("worker_gpu", "?"),
+        int(last_row["checkpoint_epoch"]),
+        float(last_row["trajectory_endpoint_translation_error_percent"]),
+        float(last_row["trajectory_endpoint_rotation_error_deg_per_m"]),
+    )
 
 
 def _get_worker_context(args_dict, gpu_id):
@@ -211,68 +224,49 @@ def _get_worker_context(args_dict, gpu_id):
     return _WORKER_ARGS, _WORKER_PREPARED_SEGMENTS
 
 
-def _evaluate_single_checkpoint(
-    args_dict,
-    checkpoint_path,
-    gpu_id,
-    save_per_ckpt_summary,
-    output_dir,
-    translation_key,
-    rotation_key,
-):
+def _evaluate_single_checkpoint(args_dict, checkpoint_path, gpu_id, output_dir):
     args, prepared_segments = _get_worker_context(args_dict, gpu_id)
-
-    checkpoint_output_dir = None
-    if save_per_ckpt_summary:
-        checkpoint_output_dir = os.path.join(output_dir, "checkpoints", checkpoint_label(checkpoint_path))
+    checkpoint_output_dir = os.path.join(output_dir, "checkpoints", checkpoint_label(checkpoint_path))
     summary, _, _ = evaluate_checkpoint(
         args,
         checkpoint_path=checkpoint_path,
         output_dir=checkpoint_output_dir,
         prepared_segments=prepared_segments,
-        summary_only=True,
-        skip_plots=True,
-        skip_segment_artifacts=True,
+        summary_only=False,
+        skip_plots=False,
+        skip_segment_artifacts=False,
         show_progress=False,
     )
     summary["worker_gpu"] = int(gpu_id)
-    return build_ranking_row(summary, translation_key, rotation_key)
+    return build_evaluation_row(summary, checkpoint_output_dir)
 
 
-def evaluate_rankings_parallel(args, checkpoint_paths, show_progress=True):
+def evaluate_checkpoints_parallel(args, checkpoint_paths, show_progress=True):
     gpu_ids = parse_gpu_ids(args)
     checkpoint_gpu_pairs, worker_gpu_ids = build_checkpoint_gpu_pairs(checkpoint_paths, gpu_ids, args.jobs_per_gpu)
     args_dict = vars(args).copy()
     args_dict.pop("device", None)
 
-    ranking_rows = []
+    evaluation_rows = []
     progress_bar = tqdm(
         total=len(checkpoint_paths),
-        desc="Sweep",
+        desc="Detailed eval",
         unit="ckpt",
         dynamic_ncols=True,
         disable=not show_progress,
     )
 
     def _consume_result(row):
-        ranking_rows.append(row)
+        evaluation_rows.append(row)
         progress_bar.update(1)
-        progress_bar.set_postfix_str(format_progress_postfix(row, best_ranking_row(ranking_rows)))
+        progress_bar.set_postfix_str(format_progress_postfix(row))
 
     try:
         if len(worker_gpu_ids) == 1:
             for checkpoint_path, gpu_id in checkpoint_gpu_pairs:
-                row = _evaluate_single_checkpoint(
-                    args_dict,
-                    checkpoint_path,
-                    gpu_id,
-                    args.save_per_ckpt_summary,
-                    args.output_dir,
-                    args.rank_translation_key,
-                    args.rank_rotation_key,
-                )
+                row = _evaluate_single_checkpoint(args_dict, checkpoint_path, gpu_id, args.output_dir)
                 _consume_result(row)
-            return ranking_rows
+            return evaluation_rows
 
         mp_context = mp.get_context("spawn")
         with ExitStack() as stack:
@@ -289,10 +283,7 @@ def evaluate_rankings_parallel(args, checkpoint_paths, show_progress=True):
                     args_dict,
                     checkpoint_path,
                     gpu_id,
-                    args.save_per_ckpt_summary,
                     args.output_dir,
-                    args.rank_translation_key,
-                    args.rank_rotation_key,
                 )
                 futures[future] = {
                     "checkpoint_path": checkpoint_path,
@@ -310,7 +301,7 @@ def evaluate_rankings_parallel(args, checkpoint_paths, show_progress=True):
                         )
                     ) from exc
                 _consume_result(row)
-        return ranking_rows
+        return evaluation_rows
     finally:
         progress_bar.close()
 
@@ -319,65 +310,73 @@ def main():
     parser = build_parser()
     args = finalize_translonet_args(parser.parse_args())
     validate_args(parser, args, require_ckpt=False, require_output_dir=True)
-    args.summary_only = True
-    args.skip_plots = True
-    args.skip_segment_artifacts = True
+    args.summary_only = False
+    args.skip_plots = False
+    args.skip_segment_artifacts = False
 
-    if args.top_k < 1:
-        parser.error("--top_k must be >= 1")
     if args.jobs_per_gpu < 1:
         parser.error("--jobs_per_gpu must be >= 1")
+    if args.epoch_stride < 1:
+        parser.error("--epoch_stride must be >= 1")
 
     checkpoint_paths = sorted(glob.glob(args.ckpt_glob))
     if not checkpoint_paths:
         parser.error("No checkpoints matched --ckpt_glob {}".format(args.ckpt_glob))
 
+    selected_checkpoint_paths = select_checkpoint_paths(
+        checkpoint_paths,
+        after_epoch=args.after_epoch,
+        epoch_stride=args.epoch_stride,
+    )
+    if not selected_checkpoint_paths:
+        parser.error(
+            "No checkpoints matched epoch filter: epoch > {} and every {} epochs thereafter".format(
+                args.after_epoch,
+                args.epoch_stride,
+            )
+        )
+
     gpu_ids = parse_gpu_ids(args)
     total_workers = len(gpu_ids) * int(args.jobs_per_gpu)
+    selected_epochs = [extract_checkpoint_epoch(path) for path in selected_checkpoint_paths]
     print(
-        "Sweep config: {} checkpoints across GPUs {} with {} parallel workers".format(
+        "Detailed eval config: {} selected checkpoints (from {} matched) across GPUs {} with {} parallel workers".format(
+            len(selected_checkpoint_paths),
             len(checkpoint_paths),
             ",".join(str(gpu_id) for gpu_id in gpu_ids),
             total_workers,
         )
     )
+    print(
+        "Epoch filter: epoch > {} and every {} epochs thereafter -> {}".format(
+            args.after_epoch,
+            args.epoch_stride,
+            ", ".join(str(epoch) for epoch in selected_epochs),
+        )
+    )
 
     os.makedirs(args.output_dir, exist_ok=True)
-    ranking_rows = evaluate_rankings_parallel(args, checkpoint_paths, show_progress=True)
-    ranking_rows = sort_ranking_rows(ranking_rows)
-    top_k_rows = ranking_rows[: min(args.top_k, len(ranking_rows))]
-    ranking_payload = {
+    evaluation_rows = evaluate_checkpoints_parallel(args, selected_checkpoint_paths, show_progress=True)
+    evaluation_rows = sort_evaluation_rows(evaluation_rows)
+    manifest = {
         "sequence_name": args.oxford_eval_seq,
         "mask_h5_name": args.oxford_eval_mask_name,
         "checkpoint_glob": args.ckpt_glob,
-        "checkpoint_count": int(len(ranking_rows)),
-        "top_k": int(min(args.top_k, len(ranking_rows))),
-        "rank_translation_key": args.rank_translation_key,
-        "rank_rotation_key": args.rank_rotation_key,
+        "matched_checkpoint_count": int(len(checkpoint_paths)),
+        "selected_checkpoint_count": int(len(evaluation_rows)),
+        "after_epoch": int(args.after_epoch),
+        "epoch_stride": int(args.epoch_stride),
+        "selected_epochs": [int(row["checkpoint_epoch"]) for row in evaluation_rows],
         "gpu_ids": gpu_ids,
         "jobs_per_gpu": int(args.jobs_per_gpu),
-        "ranking": ranking_rows,
-        "top_k_ranking": top_k_rows,
+        "evaluations": evaluation_rows,
     }
 
-    write_csv(os.path.join(args.output_dir, "checkpoint_ranking.csv"), ranking_rows)
-    write_json(os.path.join(args.output_dir, "checkpoint_ranking.json"), ranking_payload)
-    write_json(os.path.join(args.output_dir, "best_checkpoint.json"), top_k_rows[0])
-    if len(top_k_rows) > 1:
-        write_json(os.path.join(args.output_dir, "top_k_checkpoints.json"), top_k_rows)
+    write_csv(os.path.join(args.output_dir, "detailed_evaluations.csv"), evaluation_rows)
+    write_json(os.path.join(args.output_dir, "detailed_evaluations.json"), manifest)
 
-    best = top_k_rows[0]
-    print("Ranked {} checkpoints on {}".format(len(ranking_rows), args.oxford_eval_seq))
-    print("Best checkpoint: {}".format(best["checkpoint_path"]))
-    print(
-        "Best metrics: {}={:.6f}, {}={:.6f}".format(
-            best["translation_metric_key"],
-            best["translation_metric"],
-            best["rotation_metric_key"],
-            best["rotation_metric"],
-        )
-    )
-    print("Ranking written to {}".format(os.path.join(args.output_dir, "checkpoint_ranking.csv")))
+    print("Detailed evaluation finished for {} checkpoints on {}".format(len(evaluation_rows), args.oxford_eval_seq))
+    print("Evaluation manifest written to {}".format(os.path.join(args.output_dir, "detailed_evaluations.csv")))
 
 
 if __name__ == "__main__":

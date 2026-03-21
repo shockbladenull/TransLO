@@ -152,7 +152,9 @@ def compose_pair_transforms(pair_transforms):
     trajectory = [np.eye(4, dtype=np.float64)]
     current_pose = np.eye(4, dtype=np.float64)
     for transform in pair_transforms:
-        current_pose = np.matmul(current_pose, transform)
+        # Oxford relative transforms are encoded as current<-previous, so the
+        # segment-local pose must be accumulated by left-multiplication.
+        current_pose = np.matmul(transform, current_pose)
         trajectory.append(current_pose.copy())
     return np.asarray(trajectory, dtype=np.float64)
 
@@ -349,6 +351,31 @@ def _trajectory_dict(trajectory):
     return {idx: trajectory[idx] for idx in range(len(trajectory))}
 
 
+def segment_local_trajectory_to_global(start_pose_vector, local_trajectory):
+    start_pose = np.asarray(OxfordQEDataset._qe_pose_to_matrix(start_pose_vector), dtype=np.float64)
+    local_trajectory = np.asarray(local_trajectory, dtype=np.float64)
+    global_trajectory = []
+    for local_pose in local_trajectory:
+        global_trajectory.append(np.matmul(start_pose, np.linalg.inv(local_pose)))
+    return np.asarray(global_trajectory, dtype=np.float64)
+
+
+def convert_segment_trajectories_to_global(segments, trajectories):
+    if len(segments) != len(trajectories):
+        raise ValueError('Segment metadata and trajectory lists must have identical lengths')
+    return [
+        segment_local_trajectory_to_global(segment.poses[0], trajectory)
+        for segment, trajectory in zip(segments, trajectories)
+    ]
+
+
+def _stack_positions(trajectories):
+    positions = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in trajectories]
+    if not positions:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.concatenate(positions, axis=0)
+
+
 def _set_equal_axis_2d(ax, x_values, y_values):
     x_values = np.asarray(x_values, dtype=np.float64)
     y_values = np.asarray(y_values, dtype=np.float64)
@@ -512,3 +539,117 @@ def save_segment_plots(name, gt_trajectory, pred_trajectory, output_dir):
     save_rpy_plot(name, gt_trajectory, pred_trajectory, output_dir)
     save_path_plot(name, gt_trajectory, pred_trajectory, output_dir)
     save_path_3d_plot(name, gt_trajectory, pred_trajectory, output_dir)
+
+
+def save_stitched_path_plot(name, gt_trajectories, pred_trajectories, output_dir):
+    gt_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in gt_trajectories]
+    pred_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in pred_trajectories]
+    all_positions = np.concatenate([_stack_positions(gt_trajectories), _stack_positions(pred_trajectories)], axis=0)
+
+    fig = plt.figure(figsize=(20, 6), dpi=100)
+    axes = [fig.add_subplot(1, 3, index + 1) for index in range(3)]
+    projections = (
+        (0, 2, 'x (m)', 'z (m)'),
+        (0, 1, 'x (m)', 'y (m)'),
+        (1, 2, 'y (m)', 'z (m)'),
+    )
+    for axis, (x_idx, y_idx, x_label, y_label) in zip(axes, projections):
+        for segment_index, gt_positions in enumerate(gt_positions_list):
+            axis.plot(
+                gt_positions[:, x_idx],
+                gt_positions[:, y_idx],
+                'r-',
+                label='GT' if segment_index == 0 else None,
+            )
+            axis.plot(
+                [gt_positions[0, x_idx]],
+                [gt_positions[0, y_idx]],
+                'ko',
+                label='Start' if segment_index == 0 else None,
+            )
+        for segment_index, pred_positions in enumerate(pred_positions_list):
+            axis.plot(
+                pred_positions[:, x_idx],
+                pred_positions[:, y_idx],
+                'b-',
+                label='Ours' if segment_index == 0 else None,
+            )
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.legend(loc='upper right')
+        _set_equal_axis_2d(axis, all_positions[:, x_idx], all_positions[:, y_idx])
+
+    png_path = os.path.join(output_dir, '{}_path.png'.format(name))
+    pdf_path = os.path.join(output_dir, '{}_path.pdf'.format(name))
+    fig.tight_layout()
+    fig.savefig(png_path, bbox_inches='tight', pad_inches=0.1)
+    pdf = matplotlib.backends.backend_pdf.PdfPages(pdf_path)
+    pdf.savefig(fig)
+    pdf.close()
+    plt.close(fig)
+
+
+def save_stitched_path_3d_plot(name, gt_trajectories, pred_trajectories, output_dir):
+    gt_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in gt_trajectories]
+    pred_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in pred_trajectories]
+
+    fig = plt.figure(figsize=(8, 8), dpi=110)
+    axis = fig.add_subplot(111, projection='3d')
+    for segment_index, pred_positions in enumerate(pred_positions_list):
+        axis.plot(
+            pred_positions[:, 0],
+            pred_positions[:, 2],
+            pred_positions[:, 1],
+            'b-',
+            label='Ours' if segment_index == 0 else None,
+        )
+    for segment_index, gt_positions in enumerate(gt_positions_list):
+        axis.plot(
+            gt_positions[:, 0],
+            gt_positions[:, 2],
+            gt_positions[:, 1],
+            'r-',
+            label='GT' if segment_index == 0 else None,
+        )
+        axis.plot(
+            [gt_positions[0, 0]],
+            [gt_positions[0, 2]],
+            [gt_positions[0, 1]],
+            'ko',
+            label='Start' if segment_index == 0 else None,
+        )
+    axis.set_xlabel('x (m)')
+    axis.set_ylabel('z (m)')
+    axis.set_zlabel('y (m)')
+    axis.view_init(elev=20.0, azim=-35.0)
+    axis.legend(loc='upper right')
+
+    all_points = np.concatenate(
+        [
+            np.stack([_stack_positions(pred_trajectories)[:, 0], _stack_positions(pred_trajectories)[:, 2], _stack_positions(pred_trajectories)[:, 1]], axis=1),
+            np.stack([_stack_positions(gt_trajectories)[:, 0], _stack_positions(gt_trajectories)[:, 2], _stack_positions(gt_trajectories)[:, 1]], axis=1),
+        ],
+        axis=0,
+    )
+    center = np.mean(all_points, axis=0)
+    max_radius = max(np.max(np.abs(all_points - center), axis=0).max(), 1e-6)
+    axis.set_xlim([center[0] - max_radius, center[0] + max_radius])
+    axis.set_ylim([center[1] - max_radius, center[1] + max_radius])
+    axis.set_zlim([center[2] - max_radius, center[2] + max_radius])
+
+    png_path = os.path.join(output_dir, '{}_path_3D.png'.format(name))
+    pdf_path = os.path.join(output_dir, '{}_path_3D.pdf'.format(name))
+    fig.tight_layout()
+    fig.savefig(png_path, bbox_inches='tight', pad_inches=0.1)
+    pdf = matplotlib.backends.backend_pdf.PdfPages(pdf_path)
+    pdf.savefig(fig)
+    pdf.close()
+    plt.close(fig)
+
+
+def save_full_route_plots(name, segments, gt_trajectories, pred_trajectories, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    gt_global_trajectories = convert_segment_trajectories_to_global(segments, gt_trajectories)
+    pred_global_trajectories = convert_segment_trajectories_to_global(segments, pred_trajectories)
+    save_stitched_path_plot(name, gt_global_trajectories, pred_global_trajectories, output_dir)
+    save_stitched_path_3d_plot(name, gt_global_trajectories, pred_global_trajectories, output_dir)

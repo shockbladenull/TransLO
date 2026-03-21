@@ -6,10 +6,13 @@ from dataset_factory import split_oxford_selected_sequence_into_segments
 from oxford_lo300_rank_ckpts import (
     build_checkpoint_gpu_pairs,
     build_worker_assignments,
+    extract_checkpoint_epoch,
     format_progress_postfix,
     get_nested_metric,
     parse_gpu_ids,
-    sort_ranking_rows,
+    select_checkpoint_paths,
+    should_evaluate_checkpoint,
+    sort_evaluation_rows,
 )
 from tools.oxford_eval_tools import (
     OxfordSegment,
@@ -17,6 +20,9 @@ from tools.oxford_eval_tools import (
     build_segment_metrics,
     compose_pair_transforms,
     global_pose_vectors_to_relative_pairs,
+    qe_pose_vectors_to_matrices,
+    save_full_route_plots,
+    segment_local_trajectory_to_global,
 )
 
 
@@ -31,6 +37,32 @@ def _pose_vector(tx=0.0, ty=0.0, tz=0.0):
 
 def _translation_transform(tx=0.0, ty=0.0, tz=0.0):
     transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = np.asarray([tx, ty, tz], dtype=np.float64)
+    return transform
+
+
+
+def _pose_vector_from_matrix(transform):
+    transform = np.asarray(transform, dtype=np.float64)
+    return np.asarray([
+        transform[0, 0], transform[0, 1], transform[0, 2],
+        transform[1, 0], transform[1, 1], transform[1, 2],
+        transform[2, 0], transform[2, 1], transform[2, 2],
+        transform[0, 3], transform[1, 3], transform[2, 3],
+    ], dtype=np.float32)
+
+
+
+def _rotation_z_transform(degrees, tx=0.0, ty=0.0, tz=0.0):
+    radians = np.deg2rad(degrees)
+    cos_value = np.cos(radians)
+    sin_value = np.sin(radians)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.asarray([
+        [cos_value, -sin_value, 0.0],
+        [sin_value, cos_value, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
     transform[:3, 3] = np.asarray([tx, ty, tz], dtype=np.float64)
     return transform
 
@@ -66,6 +98,83 @@ def test_compose_pair_transforms_builds_segment_local_trajectory():
     np.testing.assert_allclose(trajectory[0], np.eye(4), atol=1e-8)
     np.testing.assert_allclose(trajectory[1][:3, 3], np.asarray([1.0, 0.0, 0.0]), atol=1e-8)
     np.testing.assert_allclose(trajectory[2][:3, 3], np.asarray([3.0, 0.0, 0.0]), atol=1e-8)
+
+
+def test_segment_local_trajectory_to_global_recovers_original_global_poses():
+    pose_vectors = np.stack([
+        _pose_vector(tx=0.0),
+        _pose_vector(tx=1.0),
+        _pose_vector(tx=3.0),
+    ], axis=0)
+
+    local_trajectory = compose_pair_transforms(global_pose_vectors_to_relative_pairs(pose_vectors))
+    recovered_global = segment_local_trajectory_to_global(pose_vectors[0], local_trajectory)
+
+    np.testing.assert_allclose(recovered_global, qe_pose_vectors_to_matrices(pose_vectors), atol=1e-8)
+
+
+def test_compose_pair_transforms_respects_non_commutative_rotation_chain():
+    pose_matrices = np.asarray([
+        _rotation_z_transform(0.0, tx=0.0, ty=0.0),
+        _rotation_z_transform(30.0, tx=1.0, ty=0.0),
+        _rotation_z_transform(60.0, tx=2.0, ty=1.0),
+        _rotation_z_transform(95.0, tx=2.5, ty=2.0),
+    ], dtype=np.float64)
+    pose_vectors = np.stack([_pose_vector_from_matrix(transform) for transform in pose_matrices], axis=0)
+
+    local_trajectory = compose_pair_transforms(global_pose_vectors_to_relative_pairs(pose_vectors))
+    recovered_global = segment_local_trajectory_to_global(pose_vectors[0], local_trajectory)
+
+    np.testing.assert_allclose(recovered_global, pose_matrices, atol=1e-8)
+
+
+
+def test_save_full_route_plots_writes_combined_path_artifacts(tmp_path):
+    segment_a = OxfordSegment(
+        sequence_name='route',
+        segment_index=0,
+        timestamps=np.asarray([10, 20, 30], dtype=np.int64),
+        poses=np.stack([
+            _pose_vector(tx=0.0),
+            _pose_vector(tx=1.0),
+            _pose_vector(tx=2.0),
+        ], axis=0),
+        aligned_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        scan_dir='/tmp',
+        start_timestamp=10,
+        end_timestamp=30,
+        start_aligned_index=0,
+        end_aligned_index=2,
+    )
+    segment_b = OxfordSegment(
+        sequence_name='route',
+        segment_index=1,
+        timestamps=np.asarray([50, 60, 70], dtype=np.int64),
+        poses=np.stack([
+            _pose_vector(tx=10.0),
+            _pose_vector(tx=11.0),
+            _pose_vector(tx=12.0),
+        ], axis=0),
+        aligned_indices=np.asarray([5, 6, 7], dtype=np.int64),
+        scan_dir='/tmp',
+        start_timestamp=50,
+        end_timestamp=70,
+        start_aligned_index=5,
+        end_aligned_index=7,
+    )
+
+    gt_trajectories = [
+        compose_pair_transforms(global_pose_vectors_to_relative_pairs(segment_a.poses)),
+        compose_pair_transforms(global_pose_vectors_to_relative_pairs(segment_b.poses)),
+    ]
+    pred_trajectories = [trajectory.copy() for trajectory in gt_trajectories]
+
+    save_full_route_plots('full_route', [segment_a, segment_b], gt_trajectories, pred_trajectories, str(tmp_path))
+
+    assert (tmp_path / 'full_route_path.png').is_file()
+    assert (tmp_path / 'full_route_path.pdf').is_file()
+    assert (tmp_path / 'full_route_path_3D.png').is_file()
+    assert (tmp_path / 'full_route_path_3D.pdf').is_file()
 
 
 def test_build_segment_metrics_returns_zero_for_perfect_prediction():
@@ -190,31 +299,58 @@ def test_get_nested_metric_reads_dotted_summary_key():
     assert value == 1.25
 
 
-def test_sort_ranking_rows_orders_by_translation_then_rotation():
+def test_extract_checkpoint_epoch_reads_epoch_from_filename():
+    checkpoint_path = '/tmp/translo_model_110_-15.000000.pth.tar'
+
+    assert extract_checkpoint_epoch(checkpoint_path) == 110
+
+
+
+def test_should_evaluate_checkpoint_filters_epochs_after_100_every_5_rounds():
+    assert should_evaluate_checkpoint(105, after_epoch=100, epoch_stride=5)
+    assert should_evaluate_checkpoint(110, after_epoch=100, epoch_stride=5)
+    assert not should_evaluate_checkpoint(100, after_epoch=100, epoch_stride=5)
+    assert not should_evaluate_checkpoint(108, after_epoch=100, epoch_stride=5)
+
+
+
+def test_select_checkpoint_paths_keeps_periodic_epochs_only():
+    checkpoint_paths = [
+        '/tmp/translo_model_098_-1.0.pth.tar',
+        '/tmp/translo_model_100_-1.0.pth.tar',
+        '/tmp/translo_model_105_-1.0.pth.tar',
+        '/tmp/translo_model_108_-1.0.pth.tar',
+        '/tmp/translo_model_110_-1.0.pth.tar',
+    ]
+
+    selected_paths = select_checkpoint_paths(checkpoint_paths, after_epoch=100, epoch_stride=5)
+
+    assert selected_paths == [
+        '/tmp/translo_model_105_-1.0.pth.tar',
+        '/tmp/translo_model_110_-1.0.pth.tar',
+    ]
+
+
+
+def test_sort_evaluation_rows_orders_by_epoch_then_name():
     rows = [
         {
-            "checkpoint_name": "epoch_010",
-            "translation_metric": 1.5,
-            "rotation_metric": 0.20,
-            "checkpoint_epoch": 10,
+            'checkpoint_name': 'epoch_110_b',
+            'checkpoint_epoch': 110,
         },
         {
-            "checkpoint_name": "epoch_020",
-            "translation_metric": 1.0,
-            "rotation_metric": 0.30,
-            "checkpoint_epoch": 20,
+            'checkpoint_name': 'epoch_105',
+            'checkpoint_epoch': 105,
         },
         {
-            "checkpoint_name": "epoch_030",
-            "translation_metric": 1.0,
-            "rotation_metric": 0.10,
-            "checkpoint_epoch": 30,
+            'checkpoint_name': 'epoch_110_a',
+            'checkpoint_epoch': 110,
         },
     ]
 
-    sorted_rows = sort_ranking_rows(rows)
+    sorted_rows = sort_evaluation_rows(rows)
 
-    assert [row["checkpoint_name"] for row in sorted_rows] == ["epoch_030", "epoch_020", "epoch_010"]
+    assert [row['checkpoint_name'] for row in sorted_rows] == ['epoch_105', 'epoch_110_a', 'epoch_110_b']
 
 
 def test_parse_gpu_ids_defaults_to_single_gpu_namespace():
@@ -243,23 +379,18 @@ def test_build_checkpoint_gpu_pairs_interleaves_worker_slots():
     assert checkpoint_gpu_pairs == [("a", 0), ("b", 0), ("c", 2), ("d", 2), ("e", 0)]
 
 
-def test_format_progress_postfix_includes_last_and_best_rows():
+def test_format_progress_postfix_includes_epoch_and_primary_metrics():
     last_row = {
-        "checkpoint_name": "translo_model_020_-6.500000",
-        "translation_metric": 1.25,
-        "rotation_metric": 0.15,
-        "worker_gpu": 2,
-    }
-    best_row = {
-        "checkpoint_name": "translo_model_018_-6.700000",
-        "translation_metric": 1.10,
-        "rotation_metric": 0.10,
+        'checkpoint_name': 'translo_model_110_-6.500000',
+        'checkpoint_epoch': 110,
+        'trajectory_endpoint_translation_error_percent': 1.25,
+        'trajectory_endpoint_rotation_error_deg_per_m': 0.15,
+        'worker_gpu': 2,
     }
 
-    postfix = format_progress_postfix(last_row, best_row)
+    postfix = format_progress_postfix(last_row)
 
-    assert "last=" in postfix
-    assert "best=" in postfix
-    assert "@g2" in postfix
-    assert "1.2500/0.1500" in postfix
-    assert "1.1000/0.1000" in postfix
+    assert 'last=' in postfix
+    assert '@g2' in postfix
+    assert 'epoch=110' in postfix
+    assert '1.2500/0.1500' in postfix
