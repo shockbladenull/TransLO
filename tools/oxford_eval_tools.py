@@ -541,10 +541,15 @@ def save_segment_plots(name, gt_trajectory, pred_trajectory, output_dir):
     save_path_3d_plot(name, gt_trajectory, pred_trajectory, output_dir)
 
 
-def save_stitched_path_plot(name, gt_trajectories, pred_trajectories, output_dir):
+def save_stitched_path_plot(name, gt_trajectories, pred_trajectories, output_dir, background_trajectory=None):
     gt_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in gt_trajectories]
     pred_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in pred_trajectories]
-    all_positions = np.concatenate([_stack_positions(gt_trajectories), _stack_positions(pred_trajectories)], axis=0)
+    all_positions_parts = [_stack_positions(gt_trajectories), _stack_positions(pred_trajectories)]
+    background_positions = None
+    if background_trajectory is not None:
+        background_positions = np.asarray(background_trajectory, dtype=np.float64)[:, :3, 3]
+        all_positions_parts.append(background_positions)
+    all_positions = np.concatenate(all_positions_parts, axis=0)
 
     fig = plt.figure(figsize=(20, 6), dpi=100)
     axes = [fig.add_subplot(1, 3, index + 1) for index in range(3)]
@@ -554,6 +559,14 @@ def save_stitched_path_plot(name, gt_trajectories, pred_trajectories, output_dir
         (1, 2, 'y (m)', 'z (m)'),
     )
     for axis, (x_idx, y_idx, x_label, y_label) in zip(axes, projections):
+        if background_positions is not None:
+            axis.plot(
+                background_positions[:, x_idx],
+                background_positions[:, y_idx],
+                color='#888888',
+                linewidth=1.0,
+                label='TXT aligned to full_h5',
+            )
         for segment_index, gt_positions in enumerate(gt_positions_list):
             axis.plot(
                 gt_positions[:, x_idx],
@@ -589,12 +602,24 @@ def save_stitched_path_plot(name, gt_trajectories, pred_trajectories, output_dir
     plt.close(fig)
 
 
-def save_stitched_path_3d_plot(name, gt_trajectories, pred_trajectories, output_dir):
+def save_stitched_path_3d_plot(name, gt_trajectories, pred_trajectories, output_dir, background_trajectory=None):
     gt_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in gt_trajectories]
     pred_positions_list = [np.asarray(trajectory, dtype=np.float64)[:, :3, 3] for trajectory in pred_trajectories]
+    background_positions = None
+    if background_trajectory is not None:
+        background_positions = np.asarray(background_trajectory, dtype=np.float64)[:, :3, 3]
 
     fig = plt.figure(figsize=(8, 8), dpi=110)
     axis = fig.add_subplot(111, projection='3d')
+    if background_positions is not None:
+        axis.plot(
+            background_positions[:, 0],
+            background_positions[:, 2],
+            background_positions[:, 1],
+            color='#888888',
+            linewidth=1.0,
+            label='TXT aligned to full_h5',
+        )
     for segment_index, pred_positions in enumerate(pred_positions_list):
         axis.plot(
             pred_positions[:, 0],
@@ -624,13 +649,15 @@ def save_stitched_path_3d_plot(name, gt_trajectories, pred_trajectories, output_
     axis.view_init(elev=20.0, azim=-35.0)
     axis.legend(loc='upper right')
 
-    all_points = np.concatenate(
-        [
-            np.stack([_stack_positions(pred_trajectories)[:, 0], _stack_positions(pred_trajectories)[:, 2], _stack_positions(pred_trajectories)[:, 1]], axis=1),
-            np.stack([_stack_positions(gt_trajectories)[:, 0], _stack_positions(gt_trajectories)[:, 2], _stack_positions(gt_trajectories)[:, 1]], axis=1),
-        ],
-        axis=0,
-    )
+    all_points_parts = [
+        np.stack([_stack_positions(pred_trajectories)[:, 0], _stack_positions(pred_trajectories)[:, 2], _stack_positions(pred_trajectories)[:, 1]], axis=1),
+        np.stack([_stack_positions(gt_trajectories)[:, 0], _stack_positions(gt_trajectories)[:, 2], _stack_positions(gt_trajectories)[:, 1]], axis=1),
+    ]
+    if background_positions is not None:
+        all_points_parts.append(
+            np.stack([background_positions[:, 0], background_positions[:, 2], background_positions[:, 1]], axis=1)
+        )
+    all_points = np.concatenate(all_points_parts, axis=0)
     center = np.mean(all_points, axis=0)
     max_radius = max(np.max(np.abs(all_points - center), axis=0).max(), 1e-6)
     axis.set_xlim([center[0] - max_radius, center[0] + max_radius])
@@ -647,9 +674,21 @@ def save_stitched_path_3d_plot(name, gt_trajectories, pred_trajectories, output_
     plt.close(fig)
 
 
-def save_full_route_plots(name, segments, gt_trajectories, pred_trajectories, output_dir):
+def save_full_route_plots(name, segments, gt_trajectories, pred_trajectories, output_dir, background_trajectory=None):
     os.makedirs(output_dir, exist_ok=True)
     gt_global_trajectories = convert_segment_trajectories_to_global(segments, gt_trajectories)
     pred_global_trajectories = convert_segment_trajectories_to_global(segments, pred_trajectories)
-    save_stitched_path_plot(name, gt_global_trajectories, pred_global_trajectories, output_dir)
-    save_stitched_path_3d_plot(name, gt_global_trajectories, pred_global_trajectories, output_dir)
+    save_stitched_path_plot(
+        name,
+        gt_global_trajectories,
+        pred_global_trajectories,
+        output_dir,
+        background_trajectory=background_trajectory,
+    )
+    save_stitched_path_3d_plot(
+        name,
+        gt_global_trajectories,
+        pred_global_trajectories,
+        output_dir,
+        background_trajectory=background_trajectory,
+    )

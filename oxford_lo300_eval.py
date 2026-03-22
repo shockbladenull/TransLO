@@ -20,6 +20,7 @@ from tools.oxford_eval_tools import (
     build_segment,
     build_segment_metrics,
     pose_array_to_rows,
+    qe_pose_vectors_to_matrices,
     save_full_route_plots,
     save_segment_plots,
     segment_metrics_to_row,
@@ -388,7 +389,14 @@ def evaluate_checkpoint(
         gt_trajectories.append(gt_trajectory)
 
     if output_dir is not None and not summary_only and not skip_plots:
-        save_full_route_plots('full_route', segments, gt_trajectories, pred_trajectories, output_dir)
+        save_full_route_plots(
+            'full_route',
+            segments,
+            gt_trajectories,
+            pred_trajectories,
+            output_dir,
+            background_trajectory=qe_pose_vectors_to_matrices(sequence_data["aligned_poses"]),
+        )
 
     elapsed_sec = time.time() - summary_start
     gpu_mem_gb, gpu_peak_mem_gb = safe_gpu_memory_stats(args.device)

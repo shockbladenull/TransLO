@@ -168,8 +168,18 @@ def test_save_full_route_plots_writes_combined_path_artifacts(tmp_path):
         compose_pair_transforms(global_pose_vectors_to_relative_pairs(segment_b.poses)),
     ]
     pred_trajectories = [trajectory.copy() for trajectory in gt_trajectories]
+    background_trajectory = qe_pose_vectors_to_matrices(
+        np.concatenate([segment_a.poses, segment_b.poses], axis=0)
+    )
 
-    save_full_route_plots('full_route', [segment_a, segment_b], gt_trajectories, pred_trajectories, str(tmp_path))
+    save_full_route_plots(
+        'full_route',
+        [segment_a, segment_b],
+        gt_trajectories,
+        pred_trajectories,
+        str(tmp_path),
+        background_trajectory=background_trajectory,
+    )
 
     assert (tmp_path / 'full_route_path.png').is_file()
     assert (tmp_path / 'full_route_path.pdf').is_file()
