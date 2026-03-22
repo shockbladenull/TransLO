@@ -159,7 +159,9 @@ def prepare_output_dirs():
         for directory in (experiment_dir, file_dir, eval_dir, log_dir, tensorboard_dir, checkpoints_dir):
             os.makedirs(directory, exist_ok=True)
         for filename in SOURCE_BACKUP_FILES:
-            shutil.copy2(os.path.join(base_dir, filename), os.path.join(log_dir, filename))
+            backup_path = os.path.join(log_dir, filename)
+            os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+            shutil.copy2(os.path.join(base_dir, filename), backup_path)
 
     barrier()
     return file_dir, eval_dir, log_dir, tensorboard_dir, checkpoints_dir
