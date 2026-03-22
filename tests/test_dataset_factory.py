@@ -120,7 +120,8 @@ def test_oxford_txt_dataset_uses_masked_timestamps_and_txt_gt(tmp_path):
     sequence_meta = dataset.sequence_meta[sequence_name]
     np.testing.assert_array_equal(sequence_meta["timestamps"], np.asarray([20, 40, 50], dtype=np.int64))
     np.testing.assert_allclose(sequence_meta["poses"][:, 9], np.asarray([1, 4, 5], dtype=np.float32))
-    assert len(dataset) == 2
+    assert [len(segment["timestamps"]) for segment in sequence_meta["segments"]] == [1, 2]
+    assert len(dataset) == 1
 
     _, _, _, t_gt, _, _, _ = dataset[0]
-    np.testing.assert_allclose(t_gt[:3, 3], np.asarray([-3.0, 0.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(t_gt[:3, 3], np.asarray([-1.0, 0.0, 0.0], dtype=np.float32))

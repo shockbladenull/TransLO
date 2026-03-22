@@ -319,26 +319,45 @@ class OxfordQEDataset(data.Dataset):
                 raise FileNotFoundError("Oxford scan directory not found: {}".format(scan_dir))
 
             if self.pose_source == "h5":
-                timestamps, poses = self._load_h5_sequence(seq_dir)
+                timestamps, poses, aligned_indices = self._load_h5_sequence(seq_dir)
             else:
-                timestamps, poses = self._load_txt_sequence(seq_dir, sequence_name)
+                timestamps, poses, aligned_indices = self._load_txt_sequence(seq_dir, sequence_name)
 
             if self.trim_edges > 0:
+                if len(timestamps) <= (2 * self.trim_edges):
+                    raise ValueError(
+                        "Sequence {} is too short after trimming {} frames on each side".format(
+                            sequence_name, self.trim_edges
+                        )
+                    )
                 timestamps = timestamps[self.trim_edges:-self.trim_edges]
                 poses = poses[self.trim_edges:-self.trim_edges]
+                aligned_indices = aligned_indices[self.trim_edges:-self.trim_edges]
 
-            if len(timestamps) != len(poses):
+            if len(timestamps) != len(poses) or len(timestamps) != len(aligned_indices):
                 raise ValueError("Oxford timestamps/poses length mismatch in sequence {}".format(sequence_name))
-            if len(timestamps) <= self.frame_gap:
-                raise ValueError("Sequence {} is too short after trimming".format(sequence_name))
+            sequence_segments = self._build_sequence_segments(
+                timestamps=timestamps,
+                poses=poses,
+                aligned_indices=aligned_indices,
+            )
+            if not sequence_segments:
+                raise ValueError("Sequence {} has no valid Oxford segments after trimming".format(sequence_name))
+            if max(len(segment["timestamps"]) for segment in sequence_segments) <= self.frame_gap:
+                raise ValueError("Sequence {} has no segment longer than frame_gap after trimming".format(sequence_name))
 
             self.sequence_meta[sequence_name] = {
                 "scan_dir": scan_dir,
                 "timestamps": timestamps.astype(np.int64),
                 "poses": poses.astype(np.float32),
+                "aligned_indices": aligned_indices.astype(np.int64),
+                "segments": sequence_segments,
             }
-            for curr_idx in range(self.frame_gap, len(timestamps)):
-                self.samples.append((sequence_name, curr_idx - self.frame_gap, curr_idx))
+            for segment_idx, segment in enumerate(sequence_segments):
+                if len(segment["timestamps"]) <= self.frame_gap:
+                    continue
+                for curr_idx in range(self.frame_gap, len(segment["timestamps"])):
+                    self.samples.append((sequence_name, segment_idx, curr_idx - self.frame_gap, curr_idx))
 
     def _load_h5_sequence(self, seq_dir):
         sequence_name = os.path.basename(seq_dir)
@@ -354,7 +373,8 @@ class OxfordQEDataset(data.Dataset):
         with h5py.File(h5_path, "r") as h5_file:
             timestamps = np.asarray(h5_file["valid_timestamps"])
             poses = np.asarray(h5_file["poses"])
-        return timestamps, poses
+        aligned_indices = np.arange(len(timestamps), dtype=np.int64)
+        return timestamps, poses, aligned_indices
 
     def _load_txt_sequence(self, seq_dir, sequence_name):
         sequence_data = load_oxford_txt_masked_sequence(
@@ -370,7 +390,19 @@ class OxfordQEDataset(data.Dataset):
             pose_skip_end=self.pose_skip_end,
             trim_edges=0,
         )
-        return sequence_data["selected_timestamps"], sequence_data["selected_poses"]
+        return (
+            sequence_data["selected_timestamps"],
+            sequence_data["selected_poses"],
+            sequence_data["selected_aligned_indices"],
+        )
+
+    @staticmethod
+    def _build_sequence_segments(timestamps, poses, aligned_indices):
+        return split_oxford_selected_sequence_into_segments(
+            selected_timestamps=np.asarray(timestamps, dtype=np.int64),
+            selected_poses=np.asarray(poses, dtype=np.float32),
+            selected_aligned_indices=np.asarray(aligned_indices, dtype=np.int64),
+        )
 
     def _resolve_pose_txt_path(self, sequence_name):
         sequence_short = _oxford_sequence_short_name(sequence_name)
@@ -384,18 +416,19 @@ class OxfordQEDataset(data.Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        sequence_name, prev_idx, curr_idx = self.samples[index]
+        sequence_name, segment_idx, prev_idx, curr_idx = self.samples[index]
         sequence_meta = self.sequence_meta[sequence_name]
+        segment_meta = sequence_meta["segments"][segment_idx]
 
-        prev_timestamp = int(sequence_meta["timestamps"][prev_idx])
-        curr_timestamp = int(sequence_meta["timestamps"][curr_idx])
+        prev_timestamp = int(segment_meta["timestamps"][prev_idx])
+        curr_timestamp = int(segment_meta["timestamps"][curr_idx])
         prev_scan_path = os.path.join(sequence_meta["scan_dir"], "{}.bin".format(prev_timestamp))
         curr_scan_path = os.path.join(sequence_meta["scan_dir"], "{}.bin".format(curr_timestamp))
 
         point1 = self._load_oxford_scan(prev_scan_path)
         point2 = self._load_oxford_scan(curr_scan_path)
-        T_prev = self._qe_pose_to_matrix(sequence_meta["poses"][prev_idx])
-        T_curr = self._qe_pose_to_matrix(sequence_meta["poses"][curr_idx])
+        T_prev = self._qe_pose_to_matrix(segment_meta["poses"][prev_idx])
+        T_curr = self._qe_pose_to_matrix(segment_meta["poses"][curr_idx])
         # TransLO predicts the transform from the current frame (pos2 / frame1) to the previous frame (pos1 / frame2).
         T_gt = np.matmul(np.linalg.inv(T_curr), T_prev).astype(np.float32)
 
