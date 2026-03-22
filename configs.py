@@ -114,6 +114,10 @@ def add_translonet_args(parser):
                         help='QEOxford validation sequences')
     parser.add_argument('--oxford_trim_edges', type=int, default=None,
                         help='Additional trim applied after timestamps and poses are aligned')
+    parser.add_argument('--oxford_detailed_val', action='store_true',
+                        help='Run periodic Oxford route validation plots in addition to fast pair-wise validation')
+    parser.add_argument('--oxford_detailed_val_interval', type=int, default=5,
+                        help='Run Oxford detailed route validation every N epochs')
     parser.add_argument('--frame_gap', type=int, default=1,
                         help='Temporal gap used to form relative pose pairs')
     parser.add_argument('--kitti_train_seqs', nargs='+', type=int, default=list(DEFAULT_KITTI_TRAIN_SEQS),
@@ -190,6 +194,8 @@ def finalize_translonet_args(args):
         args.oxford_trim_edges = 0 if args.oxford_pose_source == 'txt' else 5
     if args.save_eval_interval <= 0:
         raise ValueError('--save_eval_interval must be a positive integer')
+    if args.oxford_detailed_val_interval <= 0:
+        raise ValueError('--oxford_detailed_val_interval must be a positive integer')
     args = _resolve_sensor_profile(args)
     return args
 

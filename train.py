@@ -23,6 +23,7 @@ from kitti_pytorch import points_dataset
 from tools.excel_tools import SaveExcel
 from tools.euler_tools import quat2mat
 from tools.logger_tools import creat_logger, log_print
+from tools.oxford_train_eval import run_oxford_detailed_val, should_run_oxford_detailed_val
 from tools.tensorboard_tools import (
     log_model_histograms,
     log_scalar_group,
@@ -45,6 +46,7 @@ SOURCE_BACKUP_FILES = (
     'translo_model_utils.py',
     'conv_util.py',
     'kitti_pytorch.py',
+    'tools/oxford_train_eval.py',
 )
 
 PROGRESS_UPDATE_INTERVAL = 10
@@ -814,6 +816,21 @@ def main():
                         metric_logs=metric_logs,
                         lr='{:.6e}'.format(lr),
                         tb_writer=tb_writer,
+                    )
+                barrier()
+
+            if should_run_oxford_detailed_val(args, epoch):
+                barrier()
+                if is_main_process():
+                    log_message(logger, 'Epoch {:03d}: starting Oxford detailed validation'.format(epoch))
+                    run_oxford_detailed_val(
+                        unwrap_model(model),
+                        args.device,
+                        args,
+                        eval_dir,
+                        epoch,
+                        log_fn=lambda message: log_message(logger, message),
+                        show_progress=False,
                     )
                 barrier()
     finally:
