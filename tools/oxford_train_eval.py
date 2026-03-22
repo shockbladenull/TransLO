@@ -10,6 +10,7 @@ from tools.oxford_eval_tools import (
     qe_pose_vectors_to_matrices,
     save_full_route_plots,
 )
+from tools.tensorboard_tools import log_oxford_route_images
 
 
 def should_run_oxford_detailed_val(args, epoch):
@@ -91,7 +92,7 @@ def build_oxford_detailed_summary(sequence_name, mask_name, epoch, output_dir, s
     }
 
 
-def run_oxford_detailed_val(model, device, args, eval_dir, epoch, log_fn=None, show_progress=False):
+def run_oxford_detailed_val(model, device, args, eval_dir, epoch, log_fn=None, show_progress=False, tb_writer=None):
     if args.oxford_pose_source != "txt":
         raise ValueError("Oxford detailed validation currently requires --oxford_pose_source txt")
 
@@ -125,6 +126,7 @@ def run_oxford_detailed_val(model, device, args, eval_dir, epoch, log_fn=None, s
             output_dir,
             background_trajectory=qe_pose_vectors_to_matrices(sequence_data["aligned_poses"]),
         )
+        log_oxford_route_images(tb_writer, sequence_name, output_dir, epoch)
 
         summary = build_oxford_detailed_summary(
             sequence_name=sequence_name,

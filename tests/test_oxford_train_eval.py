@@ -63,6 +63,7 @@ def test_should_run_oxford_detailed_val_requires_enabled_txt_oxford():
 def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch):
     args = _base_args()
     calls = []
+    image_calls = []
 
     def fake_load_sequence(**kwargs):
         sequence_name = kwargs["sequence_name"]
@@ -130,6 +131,13 @@ def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch
     monkeypatch.setattr(oxford_train_eval, "load_oxford_txt_masked_sequence", fake_load_sequence)
     monkeypatch.setattr(oxford_train_eval, "evaluate_segment", fake_evaluate_segment)
     monkeypatch.setattr(oxford_train_eval, "save_full_route_plots", fake_save_full_route_plots)
+    monkeypatch.setattr(
+        oxford_train_eval,
+        "log_oxford_route_images",
+        lambda writer, sequence_name, output_dir, step: image_calls.append((writer, sequence_name, output_dir, step)),
+    )
+
+    writer = object()
 
     summaries = oxford_train_eval.run_oxford_detailed_val(
         model=object(),
@@ -138,10 +146,15 @@ def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch
         eval_dir=str(tmp_path / "eval"),
         epoch=5,
         show_progress=False,
+        tb_writer=writer,
     )
 
     assert len(summaries) == 2
     assert len(calls) == 2
+    assert image_calls == [
+        (writer, "seq_a", str(tmp_path / "eval" / "oxford_detailed" / "epoch_005" / "seq_a"), 5),
+        (writer, "seq_b", str(tmp_path / "eval" / "oxford_detailed" / "epoch_005" / "seq_b"), 5),
+    ]
 
     for sequence_name in args.oxford_val_seqs:
         output_dir = tmp_path / "eval" / "oxford_detailed" / "epoch_005" / sequence_name

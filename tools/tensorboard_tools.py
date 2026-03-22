@@ -1,4 +1,8 @@
+import os
 from typing import Dict, Iterable, Tuple
+
+import numpy as np
+from PIL import Image
 
 
 def should_log_histograms(epoch: int, every_n_epochs: int = 5) -> bool:
@@ -28,6 +32,34 @@ def log_model_histograms(
         writer.add_histogram("{}/{}".format(parameter_prefix, tag_name), parameter.detach().cpu(), step)
         if parameter.grad is not None:
             writer.add_histogram("{}/{}".format(gradient_prefix, tag_name), parameter.grad.detach().cpu(), step)
+
+
+def log_image_file(writer, tag: str, image_path: str, step: int) -> None:
+    if writer is None or not os.path.isfile(image_path):
+        return
+
+    with Image.open(image_path) as image:
+        image_array = np.asarray(image.convert("RGB"))
+
+    writer.add_image(tag, image_array, step, dataformats="HWC")
+
+
+def log_oxford_route_images(writer, sequence_name: str, output_dir: str, step: int) -> None:
+    if writer is None:
+        return
+
+    log_image_file(
+        writer,
+        "oxford_detailed/{}/full_route_path".format(sequence_name),
+        os.path.join(output_dir, "full_route_path.png"),
+        step,
+    )
+    log_image_file(
+        writer,
+        "oxford_detailed/{}/full_route_path_3D".format(sequence_name),
+        os.path.join(output_dir, "full_route_path_3D.png"),
+        step,
+    )
 
 
 def train_global_step(epoch: int, step: int, steps_per_epoch: int) -> int:

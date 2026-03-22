@@ -25,9 +25,7 @@ from tools.euler_tools import quat2mat
 from tools.logger_tools import creat_logger, log_print
 from tools.oxford_train_eval import run_oxford_detailed_val, should_run_oxford_detailed_val
 from tools.tensorboard_tools import (
-    log_model_histograms,
     log_scalar_group,
-    should_log_histograms,
     train_global_step,
 )
 from translo_model import get_loss, translo_model
@@ -778,8 +776,10 @@ def main():
                     },
                     epoch,
                 )
-                if should_log_histograms(epoch):
-                    log_model_histograms(tb_writer, unwrap_model(model).named_parameters(), epoch)
+                # Disable params/grads histogram logging in TensorBoard to keep the UI focused on
+                # scalar metrics and Oxford route visualizations.
+                # if should_log_histograms(epoch):
+                #     log_model_histograms(tb_writer, unwrap_model(model).named_parameters(), epoch)
 
             if epoch % args.save_eval_interval == 0:
                 barrier()
@@ -831,6 +831,7 @@ def main():
                         epoch,
                         log_fn=lambda message: log_message(logger, message),
                         show_progress=False,
+                        tb_writer=tb_writer,
                     )
                 barrier()
     finally:
