@@ -26,6 +26,7 @@ def _base_args():
         oxford_detailed_val_interval=5,
         val_dataset_type="oxford_qe",
         oxford_pose_source="txt",
+        oxford_train_seqs=["2019-01-11-14-02-26-radar-oxford-10k"],
         oxford_val_seqs=["seq_a", "seq_b"],
         oxford_root="/tmp/oxford",
         oxford_h5_name="mask.h5",
@@ -60,12 +61,31 @@ def test_should_run_oxford_detailed_val_requires_enabled_txt_oxford():
     assert not oxford_train_eval.should_run_oxford_detailed_val(args, 5)
 
 
+def test_build_oxford_detailed_targets_uses_train_scr_and_0300_lo():
+    args = _base_args()
+
+    targets = oxford_train_eval.build_oxford_detailed_targets(args)
+
+    assert targets == [
+        {
+            "sequence_name": "2019-01-11-14-02-26-radar-oxford-10k",
+            "mask_name": "velodyne_left_calibrateFalse_SCR300m.h5",
+        },
+        {
+            "sequence_name": "2019-01-17-14-03-00-radar-oxford-10k",
+            "mask_name": "velodyne_left_calibrateFalse_LO300m.h5",
+        },
+    ]
+
+
 def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch):
     args = _base_args()
     calls = []
     image_calls = []
+    load_calls = []
 
     def fake_load_sequence(**kwargs):
+        load_calls.append((kwargs["sequence_name"], kwargs["h5_name"]))
         sequence_name = kwargs["sequence_name"]
         base_tx = 0.0 if sequence_name == "seq_a" else 10.0
         poses = np.stack(
@@ -133,6 +153,14 @@ def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch
     monkeypatch.setattr(oxford_train_eval, "save_full_route_plots", fake_save_full_route_plots)
     monkeypatch.setattr(
         oxford_train_eval,
+        "build_oxford_detailed_targets",
+        lambda _args: [
+            {"sequence_name": "seq_a", "mask_name": "scr.h5"},
+            {"sequence_name": "seq_b", "mask_name": "lo.h5"},
+        ],
+    )
+    monkeypatch.setattr(
+        oxford_train_eval,
         "log_oxford_route_images",
         lambda writer, sequence_name, output_dir, step: image_calls.append((writer, sequence_name, output_dir, step)),
     )
@@ -151,6 +179,7 @@ def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch
 
     assert len(summaries) == 2
     assert len(calls) == 2
+    assert load_calls == [("seq_a", "scr.h5"), ("seq_b", "lo.h5")]
     assert image_calls == [
         (writer, "seq_a", str(tmp_path / "eval" / "oxford_detailed" / "epoch_005" / "seq_a"), 5),
         (writer, "seq_b", str(tmp_path / "eval" / "oxford_detailed" / "epoch_005" / "seq_b"), 5),
@@ -166,7 +195,7 @@ def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch
         with summary_path.open() as handle:
             payload = json.load(handle)
         assert payload["sequence_name"] == sequence_name
-        assert payload["mask_h5_name"] == "mask.h5"
+        assert payload["mask_h5_name"] == ("scr.h5" if sequence_name == "seq_a" else "lo.h5")
         assert payload["segment_count"] == 1
         assert payload["ranking_metrics"]["pairwise_translation_mean_m"] == 0.1
         assert payload["route_artifacts"]["full_route_path_3D_png"] == "full_route_path_3D.png"

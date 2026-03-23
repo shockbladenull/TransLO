@@ -3,7 +3,7 @@ import os
 import time
 
 from dataset_factory import load_oxford_txt_masked_sequence, split_oxford_selected_sequence_into_segments
-from oxford_lo300_eval import evaluate_segment
+from oxford_lo300_eval import DEFAULT_OXFORD_EVAL_SEQ, DEFAULT_OXFORD_LO_MASK, evaluate_segment
 from tools.oxford_eval_tools import (
     aggregate_segment_metrics,
     build_segment,
@@ -11,6 +11,8 @@ from tools.oxford_eval_tools import (
     save_full_route_plots,
 )
 from tools.tensorboard_tools import log_oxford_route_images
+
+DEFAULT_OXFORD_SCR_MASK = "velodyne_left_calibrateFalse_SCR300m.h5"
 
 
 def should_run_oxford_detailed_val(args, epoch):
@@ -23,6 +25,22 @@ def should_run_oxford_detailed_val(args, epoch):
     )
 
 
+def build_oxford_detailed_targets(args):
+    if not getattr(args, "oxford_train_seqs", None):
+        raise ValueError("Oxford detailed validation requires at least one training sequence")
+
+    return [
+        {
+            "sequence_name": args.oxford_train_seqs[0],
+            "mask_name": DEFAULT_OXFORD_SCR_MASK,
+        },
+        {
+            "sequence_name": DEFAULT_OXFORD_EVAL_SEQ,
+            "mask_name": DEFAULT_OXFORD_LO_MASK,
+        },
+    ]
+
+
 def build_oxford_detailed_output_dir(eval_dir, epoch, sequence_name):
     return os.path.join(
         eval_dir,
@@ -32,11 +50,11 @@ def build_oxford_detailed_output_dir(eval_dir, epoch, sequence_name):
     )
 
 
-def load_oxford_detailed_sequence(args, sequence_name):
+def load_oxford_detailed_sequence(args, sequence_name, mask_name):
     sequence_data = load_oxford_txt_masked_sequence(
         root_dir=args.oxford_root,
         sequence_name=sequence_name,
-        h5_name=args.oxford_h5_name,
+        h5_name=mask_name,
         h5_root=args.oxford_h5_root,
         full_h5_name=args.oxford_full_h5_name,
         full_h5_root=args.oxford_full_h5_root,
@@ -97,9 +115,11 @@ def run_oxford_detailed_val(model, device, args, eval_dir, epoch, log_fn=None, s
         raise ValueError("Oxford detailed validation currently requires --oxford_pose_source txt")
 
     summaries = []
-    for sequence_name in args.oxford_val_seqs:
+    for target in build_oxford_detailed_targets(args):
+        sequence_name = target["sequence_name"]
+        mask_name = target["mask_name"]
         start_time = time.time()
-        sequence_data, segments = load_oxford_detailed_sequence(args, sequence_name)
+        sequence_data, segments = load_oxford_detailed_sequence(args, sequence_name, mask_name)
 
         segment_metrics = []
         pred_trajectories = []
@@ -130,7 +150,7 @@ def run_oxford_detailed_val(model, device, args, eval_dir, epoch, log_fn=None, s
 
         summary = build_oxford_detailed_summary(
             sequence_name=sequence_name,
-            mask_name=args.oxford_h5_name,
+            mask_name=mask_name,
             epoch=epoch,
             output_dir=output_dir,
             sequence_data=sequence_data,
