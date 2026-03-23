@@ -28,7 +28,7 @@ SENSOR_PROFILES = {
     # Keep a 64-row projection grid for compatibility with the current backbone.
     "oxford_hdl32": {
         "H_input": 64,
-        "W_input": 1024,
+        "W_input": 1792,
         "vertical_view_up": 10.67,
         "vertical_view_down": -30.67,
     },
