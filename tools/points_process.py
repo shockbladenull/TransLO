@@ -103,11 +103,19 @@ def filter_points(points: np.ndarray, npoints: int = 8192, fov_filter=True, furt
             return limited_points[sample_all]
 
 
-def aug_matrix():
-    
-    anglex = np.clip(0.01 * np.random.randn(), -0.02, 0.02).astype(np.float32) * np.pi / 4.0
-    angley = np.clip(0.01 * np.random.randn(), -0.02, 0.02).astype(np.float32) * np.pi / 4.0
-    anglez = np.clip(0.05 * np.random.randn(), -0.1, 0.1).astype(np.float32) * np.pi / 4.0
+def _sample_clipped_normal(sigma, clip):
+    return np.float32(np.clip(sigma * np.random.randn(), -clip, clip))
+
+
+def _build_aug_matrix(
+    rotation_sigmas_deg,
+    rotation_clips_deg,
+    translation_sigmas,
+    translation_clips,
+):
+    anglex = np.deg2rad(_sample_clipped_normal(rotation_sigmas_deg[0], rotation_clips_deg[0]))
+    angley = np.deg2rad(_sample_clipped_normal(rotation_sigmas_deg[1], rotation_clips_deg[1]))
+    anglez = np.deg2rad(_sample_clipped_normal(rotation_sigmas_deg[2], rotation_clips_deg[2]))
 
     cosx = np.cos(anglex)
     cosy = np.cos(angley)
@@ -115,7 +123,7 @@ def aug_matrix():
     sinx = np.sin(anglex)
     siny = np.sin(angley)
     sinz = np.sin(anglez)
-    
+
     Rx = np.array([[1, 0, 0],
                     [0, cosx, -sinx],
                     [0, sinx, cosx]])
@@ -128,11 +136,10 @@ def aug_matrix():
 
     scale = np.diag(np.random.uniform(1.00, 1.00, 3).astype(np.float32))
     R_trans = Rx.dot(Ry).dot(Rz).dot(scale.T)
-    # R_trans = Rx.dot(Ry).dot(Rz)
 
-    xx = np.clip(0.5 * np.random.randn(), -1.0, 1.0).astype(np.float32)
-    yy = np.clip(0.1 * np.random.randn(), -0.2, 0.2).astype(np.float32)
-    zz = np.clip(0.05 * np.random.randn(), -0.15, 0.15).astype(np.float32)
+    xx = _sample_clipped_normal(translation_sigmas[0], translation_clips[0])
+    yy = _sample_clipped_normal(translation_sigmas[1], translation_clips[1])
+    zz = _sample_clipped_normal(translation_sigmas[2], translation_clips[2])
 
     add_xyz = np.array([[xx], [yy], [zz]])
 
@@ -142,6 +149,24 @@ def aug_matrix():
     T_trans = np.concatenate([T_trans, filler], axis=0)  # 4*4
 
     return T_trans
+
+
+def aug_matrix():
+    return _build_aug_matrix(
+        rotation_sigmas_deg=(0.45, 0.45, 2.25),
+        rotation_clips_deg=(0.9, 0.9, 4.5),
+        translation_sigmas=(0.5, 0.1, 0.05),
+        translation_clips=(1.0, 0.2, 0.15),
+    )
+
+
+def aug_matrix_oxford_light():
+    return _build_aug_matrix(
+        rotation_sigmas_deg=(0.05, 0.05, 0.15),
+        rotation_clips_deg=(0.1, 0.1, 0.3),
+        translation_sigmas=(0.075, 0.015, 0.0075),
+        translation_clips=(0.15, 0.03, 0.0225),
+    )
 
 
 

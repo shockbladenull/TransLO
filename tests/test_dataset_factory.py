@@ -1,6 +1,7 @@
 import numpy as np
 import h5py
 
+import dataset_factory
 from dataset_factory import (
     OxfordQEDataset,
     _align_txt_poses_to_full_timestamps,
@@ -125,3 +126,68 @@ def test_oxford_txt_dataset_uses_masked_timestamps_and_txt_gt(tmp_path):
 
     _, _, _, t_gt, _, _, _ = dataset[0]
     np.testing.assert_allclose(t_gt[:3, 3], np.asarray([-1.0, 0.0, 0.0], dtype=np.float32))
+
+
+def test_oxford_training_dataset_uses_light_augmentation_helper(tmp_path, monkeypatch):
+    sequence_name = "2019-01-14-12-05-52-radar-oxford-10k"
+    sequence_short = _oxford_sequence_short_name(sequence_name)
+    sequence_dir = tmp_path / sequence_name
+    scan_dir = sequence_dir / "velodyne_left"
+    pose_dir = tmp_path / "poses"
+    scan_dir.mkdir(parents=True)
+    pose_dir.mkdir()
+
+    full_timestamps = np.asarray([10, 20, 30, 40, 50, 60], dtype=np.int64)
+    mask_timestamps = np.asarray([10, 20, 40, 50, 60], dtype=np.int64)
+    for timestamp in mask_timestamps:
+        _write_scan(scan_dir / "{}.bin".format(int(timestamp)))
+
+    _write_h5(sequence_dir / "velodyne_left_calibrateFalse.h5", full_timestamps)
+    _write_h5(sequence_dir / "velodyne_left_calibrateFalse_SCR300m.h5", mask_timestamps)
+
+    txt_poses = np.asarray(
+        [
+            [1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0],
+            [1, 0, 0, 2, 0, 1, 0, 0, 0, 0, 1, 0],
+            [1, 0, 0, 4, 0, 1, 0, 0, 0, 0, 1, 0],
+            [1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0],
+        ],
+        dtype=np.float32,
+    )
+    np.savetxt(pose_dir / "gicp_{}.txt".format(sequence_short), txt_poses, fmt="%.6f")
+
+    expected_transform = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.11],
+            [0.0, 1.0, 0.0, 0.02],
+            [0.0, 0.0, 1.0, 0.01],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    monkeypatch.setattr(dataset_factory, "aug_matrix_oxford_light", lambda: expected_transform.copy())
+    monkeypatch.setattr(
+        dataset_factory,
+        "aug_matrix",
+        lambda: (_ for _ in ()).throw(AssertionError("Oxford dataset should not call KITTI aug_matrix")),
+    )
+
+    dataset = OxfordQEDataset(
+        root_dir=str(tmp_path),
+        sequence_list=[sequence_name],
+        h5_name="velodyne_left_calibrateFalse_SCR300m.h5",
+        pose_source="txt",
+        full_h5_name="velodyne_left_calibrateFalse.h5",
+        pose_root=str(pose_dir),
+        pose_txt_template="gicp_{sequence_short}.txt",
+        pose_skip_start=1,
+        pose_skip_end=1,
+        frame_gap=1,
+        trim_edges=0,
+        is_training=1,
+    )
+
+    _, _, _, _, t_trans, t_trans_inv, _ = dataset[0]
+    np.testing.assert_allclose(t_trans, expected_transform)
+    np.testing.assert_allclose(t_trans_inv, np.linalg.inv(expected_transform).astype(np.float32))

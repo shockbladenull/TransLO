@@ -5,7 +5,7 @@ import torch
 import torch.utils.data as data
 
 from kitti_pytorch import points_dataset
-from tools.points_process import aug_matrix
+from tools.points_process import aug_matrix, aug_matrix_oxford_light
 
 try:
     import h5py
@@ -433,7 +433,7 @@ class OxfordQEDataset(data.Dataset):
         T_gt = np.matmul(np.linalg.inv(T_curr), T_prev).astype(np.float32)
 
         if self.is_training:
-            T_trans = aug_matrix()
+            T_trans = aug_matrix_oxford_light()
         else:
             T_trans = self.identity_transform.copy()
         T_trans_inv = np.linalg.inv(T_trans).astype(np.float32)
