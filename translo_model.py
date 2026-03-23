@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import math
 import numpy as np
 from conv_util import PointNetSaModule, cost_volume, set_upconv_module, FlowPredictor, Conv1d
-from translo_model_utils import ProjectPCimg2SphericalRing, PreProcess, mat2euler, euler2quat, \
+from translo_model_utils import ProjectOxford32To64SphericalRing, ProjectPCimg2SphericalRing, PreProcess, mat2euler, euler2quat, \
     softmax_valid, quat2mat, inv_q, mul_q_point, mul_point_q
 from transformer.swin_transformer import BasicLayer
 from transformer.cross_swin_transformer import Cross_BasicLayer
@@ -45,6 +45,7 @@ class translo_model(nn.Module):
 
         #####   initialize the parameters (distance  &  stride ) ######
         self.H_input = H_input; self.W_input = W_input
+        self.sensor_profile = args.sensor_profile
         self.vertical_view_up = args.vertical_view_up
         self.vertical_view_down = args.vertical_view_down
 
@@ -257,11 +258,21 @@ class translo_model(nn.Module):
 
 
     def _project(self, point_clouds, features=None, H_input=None, W_input=None):
+        target_h = self.H_input if H_input is None else H_input
+        target_w = self.W_input if W_input is None else W_input
+        if self.sensor_profile == "oxford_hdl32" and target_h == 64:
+            return ProjectOxford32To64SphericalRing(
+                point_clouds,
+                features,
+                W_input=target_w,
+                vertical_view_down=self.vertical_view_down,
+                vertical_view_up=self.vertical_view_up,
+            )
         return ProjectPCimg2SphericalRing(
             point_clouds,
             features,
-            H_input=self.H_input if H_input is None else H_input,
-            W_input=self.W_input if W_input is None else W_input,
+            H_input=target_h,
+            W_input=target_w,
             vertical_view_down=self.vertical_view_down,
             vertical_view_up=self.vertical_view_up,
         )

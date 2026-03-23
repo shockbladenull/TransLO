@@ -124,6 +124,32 @@ def ProjectPCimg2SphericalRing(
         return PC_project_final,  PC_mask_final
 
 
+def duplicate_range_image_rows(range_image, repeats=2):
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1")
+    if range_image.dim() < 2:
+        raise ValueError("range_image must have at least 2 dimensions")
+    return range_image.repeat_interleave(repeats, dim=1).contiguous()
+
+
+def ProjectOxford32To64SphericalRing(
+    PC,
+    Feature=None,
+    W_input=1792,
+    vertical_view_down=-30.67,
+    vertical_view_up=10.67,
+):
+    projection, aux = ProjectPCimg2SphericalRing(
+        PC,
+        Feature=Feature,
+        H_input=32,
+        W_input=W_input,
+        vertical_view_down=vertical_view_down,
+        vertical_view_up=vertical_view_up,
+    )
+    return duplicate_range_image_rows(projection), duplicate_range_image_rows(aux)
+
+
 
 def quatt2T(q, t):
     
