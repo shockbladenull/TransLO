@@ -116,7 +116,10 @@ def setup_runtime():
                 )
             )
         torch.cuda.set_device(args.local_rank)
-        dist.init_process_group(backend='nccl')
+        dist.init_process_group(
+            backend='nccl',
+            timeout=datetime.timedelta(seconds=args.ddp_timeout_sec),
+        )
         args.device = torch.device('cuda', args.local_rank)
     else:
         if len(requested_gpus) > 1:
@@ -513,7 +516,14 @@ def main():
 
         if is_distributed():
             model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
-            log_message(logger, 'distributed training world_size={}, local_rank={}'.format(args.world_size, args.local_rank))
+            log_message(
+                logger,
+                'distributed training world_size={}, local_rank={}, timeout={}s'.format(
+                    args.world_size,
+                    args.local_rank,
+                    args.ddp_timeout_sec,
+                ),
+            )
         else:
             log_message(logger, 'single gpu is: {}'.format(args.device.index))
 

@@ -78,6 +78,8 @@ def add_translonet_args(parser):
     parser.add_argument('--eval_before', type=int, default=0, help='if 1, eval before train')
     parser.add_argument('--save_eval_interval', type=int, default=2,
                         help='Save checkpoints and run validation every N epochs')
+    parser.add_argument('--ddp_timeout_sec', type=int, default=3600,
+                        help='Distributed process group timeout in seconds')
 
     parser.add_argument('--train_dataset_type', choices=['kitti', 'oxford_qe'], default='kitti',
                         help='Dataset used for training')
@@ -194,6 +196,8 @@ def finalize_translonet_args(args):
         args.oxford_trim_edges = 0 if args.oxford_pose_source == 'txt' else 5
     if args.save_eval_interval <= 0:
         raise ValueError('--save_eval_interval must be a positive integer')
+    if args.ddp_timeout_sec <= 0:
+        raise ValueError('--ddp_timeout_sec must be a positive integer')
     if args.oxford_detailed_val_interval <= 0:
         raise ValueError('--oxford_detailed_val_interval must be a positive integer')
     args = _resolve_sensor_profile(args)

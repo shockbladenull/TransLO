@@ -1,3 +1,5 @@
+import pytest
+
 from configs import translonet_args
 
 
@@ -16,3 +18,9 @@ def test_oxford_auto_profile_uses_kitti_like_projection_width():
     assert args.W_input == 1792
     assert args.vertical_view_up == 10.67
     assert args.vertical_view_down == -30.67
+    assert args.ddp_timeout_sec == 3600
+
+
+def test_ddp_timeout_must_be_positive():
+    with pytest.raises(ValueError, match="--ddp_timeout_sec must be a positive integer"):
+        translonet_args(["--ddp_timeout_sec", "0"])
