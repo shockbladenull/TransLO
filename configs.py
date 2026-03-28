@@ -95,6 +95,8 @@ def add_translonet_args(parser):
                         help='QEOxford H5 file used for timestamps and, when pose_source=h5, poses')
     parser.add_argument('--oxford_h5_root', default=None,
                         help='Optional root directory containing oxford_h5_name sequence folders')
+    parser.add_argument('--oxford_detailed_h5_root', default=None,
+                        help='Optional root directory containing Oxford detailed-val mask H5 files')
     parser.add_argument('--oxford_pose_source', choices=['h5', 'txt'], default='h5',
                         help='Read Oxford poses from the selected H5 or an external TXT trajectory')
     parser.add_argument('--oxford_full_h5_name', default='velodyne_left_calibrateFalse.h5',

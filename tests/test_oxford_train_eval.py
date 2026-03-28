@@ -31,6 +31,7 @@ def _base_args():
         oxford_root="/tmp/oxford",
         oxford_h5_name="mask.h5",
         oxford_h5_root="/tmp/h5",
+        oxford_detailed_h5_root=None,
         oxford_full_h5_name="full.h5",
         oxford_full_h5_root="/tmp/full_h5",
         oxford_pose_root="/tmp/poses",
@@ -78,14 +79,24 @@ def test_build_oxford_detailed_targets_uses_train_scr_and_0300_lo():
     ]
 
 
+def test_resolve_oxford_detailed_h5_root_falls_back_to_oxford_h5_root():
+    args = _base_args()
+
+    assert oxford_train_eval.resolve_oxford_detailed_h5_root(args) == "/tmp/h5"
+
+    args.oxford_detailed_h5_root = "/tmp/detailed_h5"
+    assert oxford_train_eval.resolve_oxford_detailed_h5_root(args) == "/tmp/detailed_h5"
+
+
 def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch):
     args = _base_args()
+    args.oxford_detailed_h5_root = str(tmp_path / "detailed_h5")
     calls = []
     image_calls = []
     load_calls = []
 
     def fake_load_sequence(**kwargs):
-        load_calls.append((kwargs["sequence_name"], kwargs["h5_name"]))
+        load_calls.append((kwargs["sequence_name"], kwargs["h5_name"], kwargs["h5_root"]))
         sequence_name = kwargs["sequence_name"]
         base_tx = 0.0 if sequence_name == "seq_a" else 10.0
         poses = np.stack(
@@ -179,7 +190,10 @@ def test_run_oxford_detailed_val_writes_full_route_outputs(tmp_path, monkeypatch
 
     assert len(summaries) == 2
     assert len(calls) == 2
-    assert load_calls == [("seq_a", "scr.h5"), ("seq_b", "lo.h5")]
+    assert load_calls == [
+        ("seq_a", "scr.h5", str(tmp_path / "detailed_h5")),
+        ("seq_b", "lo.h5", str(tmp_path / "detailed_h5")),
+    ]
     assert image_calls == [
         (writer, "seq_a", str(tmp_path / "eval" / "oxford_detailed" / "epoch_005" / "seq_a"), 5),
         (writer, "seq_b", str(tmp_path / "eval" / "oxford_detailed" / "epoch_005" / "seq_b"), 5),

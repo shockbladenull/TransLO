@@ -50,12 +50,16 @@ def build_oxford_detailed_output_dir(eval_dir, epoch, sequence_name):
     )
 
 
+def resolve_oxford_detailed_h5_root(args):
+    return getattr(args, "oxford_detailed_h5_root", None) or args.oxford_h5_root
+
+
 def load_oxford_detailed_sequence(args, sequence_name, mask_name):
     sequence_data = load_oxford_txt_masked_sequence(
         root_dir=args.oxford_root,
         sequence_name=sequence_name,
         h5_name=mask_name,
-        h5_root=args.oxford_h5_root,
+        h5_root=resolve_oxford_detailed_h5_root(args),
         full_h5_name=args.oxford_full_h5_name,
         full_h5_root=args.oxford_full_h5_root,
         pose_root=args.oxford_pose_root,

@@ -19,6 +19,7 @@ def test_oxford_auto_profile_uses_kitti_like_projection_width():
     assert args.vertical_view_up == 10.67
     assert args.vertical_view_down == -30.67
     assert args.ddp_timeout_sec == 3600
+    assert args.oxford_detailed_h5_root is None
 
 
 def test_ddp_timeout_must_be_positive():
